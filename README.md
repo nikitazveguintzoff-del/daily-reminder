@@ -4,14 +4,16 @@ Application mobile iOS et Android pour retrouver son emploi du temps, les devoir
 
 ## Démarrage
 
-Prérequis : Node.js LTS et npm.
+Prérequis : Node.js LTS et npm. Pour Android, installe Android Studio avec le SDK Android.
 
 ```sh
 npm install
-npx expo start
+npx expo run:android
 ```
 
-Scanne le QR code avec Expo Go pour tester l'interface et les notifications locales. Pour une installation native complète, crée un development build Expo avec `npx expo run:android` ou `npx expo run:ios` (macOS requis pour iOS).
+Cette commande crée et lance un development build Android, nécessaire pour tester l'application avec Expo SDK 57. Expo Go Android ne peut pas lancer cette configuration d'`expo-notifications`. Après l'installation du build, lance Metro séparément avec `npx expo start --dev-client`.
+
+Pour iOS, crée le development build avec `npx expo run:ios` (macOS requis).
 
 ## Fonctionnalités
 

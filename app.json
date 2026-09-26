@@ -21,7 +21,8 @@
           "defaultChannel": "rappels",
           "color": "#16866A"
         }
-      ]
+      ],
+      "expo-status-bar"
     ]
   }
 }

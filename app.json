@@ -1,0 +1,27 @@
+{
+  "expo": {
+    "name": "Tempo",
+    "slug": "daily-reminder",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "scheme": "tempo",
+    "userInterfaceStyle": "light",
+    "ios": {
+      "supportsTablet": true,
+      "bundleIdentifier": "fr.dailyreminder.tempo"
+    },
+    "android": {
+      "package": "fr.dailyreminder.tempo"
+    },
+    "plugins": [
+      "expo-secure-store",
+      [
+        "expo-notifications",
+        {
+          "defaultChannel": "rappels",
+          "color": "#16866A"
+        }
+      ]
+    ]
+  }
+}

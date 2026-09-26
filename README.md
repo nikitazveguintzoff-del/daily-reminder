@@ -22,7 +22,7 @@ Scanne le QR code avec Expo Go pour tester l'interface et les notifications loca
 
 ## Synchronisation et confidentialité
 
-La connexion s'appuie sur `@papillonapp/ed-core`, un client communautaire sous GPL-3.0 pour l'API non officielle d'École Directe. Cette API peut changer et École Directe ne garantit pas la compatibilité.
+La connexion utilise directement les endpoints et formats décrits dans la [documentation communautaire de l'API École Directe](https://github.com/EduWireApps/ecoledirecte-api-docs), sans dépendre d'un client tiers. Cette API non officielle peut changer et École Directe ne garantit pas sa compatibilité.
 
 Les rappels locaux reprennent les données de la dernière synchronisation. Ouvre l'application et actualise le Journal pour mettre à jour les cours, devoirs et notes; iOS ne garantit pas l'exécution d'une synchronisation en arrière-plan à heure fixe. Sans connexion, les notifications indiquent d'ouvrir Tempo plutôt que d'afficher de fausses données.
 

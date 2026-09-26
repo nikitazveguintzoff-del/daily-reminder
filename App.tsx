@@ -33,8 +33,12 @@ import {
 } from "lucide-react-native";
 import {
   createEdSession,
+  fetchLoginChallenge,
   fetchSchoolData,
+  login,
+  resolveLoginChallenge,
   type EdSession,
+  type LoginChallenge as EdLoginChallenge,
   type SchoolData
 } from "./src/ecoleDirecte";
 import {
@@ -58,9 +62,7 @@ type LoginChallenge = {
   username: string;
   password: string;
   uuid: string;
-  question: string;
-  options: string[];
-};
+} & EdLoginChallenge;
 
 const PREFS_KEY = "tempo-reminder-preferences";
 const CREDENTIALS_KEY = "tempo-ecole-directe-credentials";
@@ -176,7 +178,7 @@ export default function App() {
     uuid: string
   ) => {
     sessionRef.current = session;
-    const account = session.student as unknown as { prenom?: string; nom?: string };
+    const account = session.student;
     setAccountName([account.prenom, account.nom].filter(Boolean).join(" "));
     setChallenge(null);
     if (rememberCredentials) {
@@ -212,20 +214,18 @@ export default function App() {
     const session = createEdSession();
     const uuid = (await SecureStore.getItemAsync(DEVICE_KEY)) || Crypto.randomUUID();
     try {
-      await session.auth.login(username.trim(), password, uuid);
+      await login(session, username.trim(), password, uuid);
       await finishConnection(session, username.trim(), password, uuid);
     } catch (error) {
-      if ((error as { code?: number })?.code === 12) {
+      if ((error as { code?: number })?.code === 250) {
         try {
-          const token = await session.auth.get2FAToken(username.trim(), password);
-          const question = await session.auth.get2FA(token);
+          const securityChallenge = await fetchLoginChallenge(session);
           setChallenge({
             session,
             username: username.trim(),
             password,
             uuid,
-            question: question.question,
-            options: question.propositions
+            ...securityChallenge
           });
           setNotice("Une vérification École Directe est nécessaire.");
         } catch (challengeError) {
@@ -244,12 +244,13 @@ export default function App() {
     setBusy(true);
     setNotice("");
     try {
-      const factors = await challenge.session.auth.resolve2FA(answer);
-      await challenge.session.auth.login(
+      const factors = await resolveLoginChallenge(challenge.session, answer);
+      await login(
+        challenge.session,
         challenge.username,
         challenge.password,
         challenge.uuid,
-        factors
+        [factors]
       );
       await finishConnection(
         challenge.session,
@@ -535,8 +536,8 @@ export default function App() {
           <Text style={styles.formDescription}>{challenge.question}</Text>
           <View style={styles.challengeOptions}>
             {challenge.options.map((option) => (
-              <Pressable key={option} onPress={() => void answerChallenge(option)} style={styles.challengeOption}>
-                <Text style={styles.challengeOptionText}>{option}</Text>
+              <Pressable key={option.value} onPress={() => void answerChallenge(option.value)} style={styles.challengeOption}>
+                <Text style={styles.challengeOptionText}>{option.label}</Text>
                 <ArrowRight size={16} color={palette.green} />
               </Pressable>
             ))}
@@ -588,7 +589,7 @@ export default function App() {
       <View style={styles.privacyNote}>
         <Text style={styles.privacyTitle}>Tes données restent sur ton téléphone</Text>
         <Text style={styles.privacyCopy}>
-          La connexion utilise un client communautaire de l'API non officielle d'École Directe. Les identifiants facultativement mémorisés sont conservés dans le stockage sécurisé du téléphone.
+          La connexion suit la documentation publique de l'API non officielle d'École Directe. Les identifiants facultativement mémorisés sont conservés dans le stockage sécurisé du téléphone.
         </Text>
       </View>
     </>

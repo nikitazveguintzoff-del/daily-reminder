@@ -179,7 +179,7 @@ export default function App() {
   ) => {
     sessionRef.current = session;
     const account = session.student;
-    setAccountName([account.prenom, account.nom].filter(Boolean).join(" "));
+    setAccountName([account?.prenom, account?.nom].filter(Boolean).join(" "));
     setChallenge(null);
     if (rememberCredentials) {
       await SecureStore.setItemAsync(

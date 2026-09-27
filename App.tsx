@@ -35,6 +35,7 @@ import {
   fetchLoginChallenge,
   fetchSchoolData,
   login,
+  relogin,
   resolveLoginChallenge,
   type EdSession,
   type LoginChallenge as EdLoginChallenge,
@@ -174,6 +175,7 @@ export default function App() {
     passToUse: string,
     prefsToUse: ReminderPreferences
   ) => {
+    console.log("[APP] Starting auto-login...");
     setBusy(true);
     setNotice("");
     const session = createEdSession();
@@ -183,10 +185,13 @@ export default function App() {
       sessionRef.current = session;
       const account = session.student;
       setAccountName([account?.prenom, account?.nom].filter(Boolean).join(" "));
+      console.log("[APP] Auto-login succeeded. Fetching school data...");
       const latestData = await fetchSchoolData(session, prefsToUse.homeworkDays);
       setData(latestData);
       await scheduleDailyReminders(prefsToUse, latestData).catch(() => false);
+      console.log("[APP] Auto-login & sync complete!");
     } catch (error) {
+      console.error("[APP] Auto-login failed:", (error as Error).message);
       if ((error as { code?: number })?.code === 250) {
         setNotice("Vérification École Directe requise. Rendez-vous dans l'onglet Compte.");
       } else {
@@ -203,6 +208,7 @@ export default function App() {
     currentPassword: string,
     uuid: string
   ) => {
+    console.log("[APP] Finishing connection...");
     sessionRef.current = session;
     const account = session.student;
     setAccountName([account?.prenom, account?.nom].filter(Boolean).join(" "));
@@ -210,7 +216,11 @@ export default function App() {
     if (rememberCredentials) {
       await SecureStore.setItemAsync(
         CREDENTIALS_KEY,
-        JSON.stringify({ username: currentUsername, password: currentPassword })
+        JSON.stringify({
+          username: currentUsername,
+          password: currentPassword,
+          accessToken: session.accessToken
+        })
       );
       await SecureStore.setItemAsync(DEVICE_KEY, uuid);
     } else {
@@ -218,11 +228,14 @@ export default function App() {
       await SecureStore.deleteItemAsync(DEVICE_KEY);
     }
     try {
+      console.log("[APP] Fetching school data after login...");
       const latestData = await fetchSchoolData(session, preferences.homeworkDays);
       setData(latestData);
       await scheduleDailyReminders(preferences, latestData).catch(() => false);
       setNotice("Compte synchronisé. Les rappels utilisent ces données jusqu'à la prochaine synchronisation.");
+      console.log("[APP] Connection and initial sync completed!");
     } catch (error) {
+      console.error("[APP] Sync failed after login:", (error as Error).message);
       setData(null);
       await scheduleDailyReminders(preferences, null).catch(() => false);
       setNotice(`Compte connecté, mais synchronisation impossible : ${(error as Error).message}`);
@@ -231,6 +244,7 @@ export default function App() {
   };
 
   const connect = async () => {
+    console.log("[APP] User initiated login...");
     if (!username.trim() || !password) {
       setNotice("Renseigne ton identifiant et ton mot de passe.");
       return;
@@ -243,6 +257,7 @@ export default function App() {
       await login(session, username.trim(), password, uuid);
       await finishConnection(session, username.trim(), password, uuid);
     } catch (error) {
+      console.error("[APP] Login failed:", (error as Error).message);
       if ((error as { code?: number })?.code === 250) {
         try {
           const securityChallenge = await fetchLoginChallenge(session);
@@ -270,6 +285,7 @@ export default function App() {
     setBusy(true);
     setNotice("");
     try {
+      console.log("[APP] Answering 2FA challenge...");
       const factors = await resolveLoginChallenge(challenge.session, answer);
       await login(
         challenge.session,
@@ -285,6 +301,7 @@ export default function App() {
         challenge.uuid
       );
     } catch (error) {
+      console.error("[APP] Challenge resolution failed:", (error as Error).message);
       setNotice(`Vérification refusée : ${(error as Error).message}`);
     } finally {
       setBusy(false);
@@ -292,6 +309,12 @@ export default function App() {
   };
 
   const refresh = async () => {
+    console.log("[APP] Refreshing data...");
+    if (!sessionRef.current && username.trim() && password) {
+      console.log("[APP] No active session, attempting connect()...");
+      await connect();
+      return;
+    }
     if (!sessionRef.current) return;
     setBusy(true);
     setNotice("");
@@ -300,7 +323,29 @@ export default function App() {
       setData(latestData);
       await scheduleDailyReminders(preferences, latestData).catch(() => false);
       setNotice("Synchronisation terminée.");
+      console.log("[APP] Refresh complete!");
     } catch (error) {
+      console.error("[APP] Refresh error:", (error as Error).message, "Code:", (error as { code?: number })?.code);
+      const errCode = (error as { code?: number })?.code;
+      if ((errCode === 520 || errCode === 525) && username.trim() && password) {
+        try {
+          console.log("[APP] Session expired (520/525). Re-logging in automatically...");
+          const session = createEdSession();
+          const uuid = (await SecureStore.getItemAsync(DEVICE_KEY)) || Crypto.randomUUID();
+          await login(session, username.trim(), password, uuid);
+          sessionRef.current = session;
+          const account = session.student;
+          setAccountName([account?.prenom, account?.nom].filter(Boolean).join(" "));
+          const latestData = await fetchSchoolData(session, preferences.homeworkDays);
+          setData(latestData);
+          await scheduleDailyReminders(preferences, latestData).catch(() => false);
+          setNotice("Session renouvelée et synchronisation terminée.");
+          console.log("[APP] Automatic re-login & refresh succeeded!");
+          return;
+        } catch (relogErr) {
+          console.error("[APP] Automatic re-login failed:", (relogErr as Error).message);
+        }
+      }
       setNotice(`Synchronisation impossible : ${(error as Error).message}`);
     } finally {
       setBusy(false);

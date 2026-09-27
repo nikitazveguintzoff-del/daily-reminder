@@ -29,12 +29,14 @@ type StudentAccount = {
   typeCompte: string;
   prenom?: string;
   nom?: string;
+  accesstoken?: string;
 };
 
 export type EdSession = {
   gtk?: string;
   token?: string;
   student?: StudentAccount;
+  accessToken?: string;
 };
 
 export type LoginChallenge = {
@@ -67,14 +69,13 @@ export function createEdSession(): EdSession {
 
 function apiError(response: ApiResponse<unknown>): EdApiError {
   const messages: Record<number, string> = {
-    250: "Une vérification de sécurité est nécessaire.",
     505: "Identifiant ou mot de passe incorrect.",
     517: "La version de l'API École Directe n'est plus acceptée.",
     520: "La session École Directe est invalide.",
     525: "La session École Directe a expiré. Reconnecte-toi."
   };
   return new EdApiError(
-    messages[response.code] || response.message || `Erreur École Directe (${response.code}).`,
+    response.message || messages[response.code] || `Erreur École Directe (${response.code}).`,
     response.code
   );
 }
@@ -98,6 +99,7 @@ async function request<T>(
   verb: "get" | "post",
   body: unknown
 ): Promise<T> {
+  console.log(`[ED-API] Request ${verb.toUpperCase()} ${path} (token=${session.token ? session.token.slice(0, 15) + "..." : "NONE"})`);
   const response = await fetch(`${API_BASE}${path}?verbe=${verb}&v=${API_VERSION}`, {
     method: "POST",
     headers: {
@@ -108,17 +110,25 @@ async function request<T>(
     body: `data=${encodeURIComponent(JSON.stringify(body))}`
   });
   const result = await readResponse<T>(response);
+  console.log(`[ED-API] Response ${path}: code=${result.code}, tokenRefreshed=${!!result.token}, message=${result.message ?? "none"}`);
+  if (result.token) {
+    session.token = result.token;
+  }
   if (result.code !== 200) throw apiError(result);
   return result.data;
 }
 
 async function getGtk(): Promise<string> {
-  const response = await fetch(`${API_BASE}/v3/login.awp?gtk=1&v=${API_VERSION}`, {
+  const url = `${API_BASE}/v3/login.awp?gtk=1&v=${API_VERSION}`;
+  console.log(`[ED-API] Fetching GTK: ${url}`);
+  const response = await fetch(url, {
     headers: { "User-Agent": USER_AGENT }
   });
-  if (!response.ok) throw new Error(`Impossible de démarrer la connexion (${response.status}).`);
+  console.log(`[ED-API] GTK HTTP Status: ${response.status}`);
   const cookies = response.headers.get("set-cookie") || response.headers.get("set-cookie2") || "";
-  const gtk = cookies.match(/(?:^|[,;\s])GTK=([^;,\s]+)/i)?.[1];
+  console.log(`[ED-API] GTK Raw Cookies: ${cookies}`);
+  const gtk = cookies.match(/GTK=([A-Za-z0-9]+)/i)?.[1];
+  console.log(`[ED-API] Extracted GTK: ${gtk ?? "NONE"}`);
   if (!gtk) throw new Error("École Directe n'a pas transmis le cookie de connexion GTK.");
   return gtk;
 }
@@ -130,7 +140,9 @@ export async function login(
   uuid: string,
   factors?: { cn: string; cv: string }[]
 ): Promise<void> {
+  console.log(`[ED-API] Login attempt for user: "${username}", uuid: "${uuid}"`);
   session.gtk ||= await getGtk();
+  console.log(`[ED-API] Using GTK header: "${session.gtk}"`);
   const response = await fetch(`${API_BASE}/v3/login.awp?v=${API_VERSION}`, {
     method: "POST",
     headers: {
@@ -143,18 +155,73 @@ export async function login(
         identifiant: username,
         motdepasse: password,
         isRelogin: false,
+        sesouvenirdemoi: true,
         uuid,
         ...(factors ? { fa: factors } : {})
       })
     )}`
   });
   const result = await readResponse<{ accounts: StudentAccount[] }>(response);
+  console.log(`[ED-API] Login response: code=${result.code}, message=${result.message ?? "none"}, token=${result.token ? "RECEIVED" : "NONE"}`);
+  session.token = result.token || undefined;
+
+  if (result.code === 250) {
+    const isInvalidMsg = result.message && (
+      result.message.toLowerCase().includes("invalide") ||
+      result.message.toLowerCase().includes("incorrect")
+    );
+    if (isInvalidMsg || !result.token) {
+      throw new EdApiError(result.message || "Identifiant ou mot de passe incorrect.", 505);
+    }
+  }
+
+  if (result.code !== 200 && result.code !== 250) throw apiError(result);
+  if (result.code === 250) throw apiError(result);
+
+  const accounts = result.data?.accounts || [];
+  console.log(`[ED-API] Accounts received: ${accounts.length}`);
+  const student = accounts.find((account) => account.typeCompte === "E") || accounts[0];
+  if (!student) throw new Error("Aucun compte élève n'est associé à ces identifiants.");
+  session.student = student;
+  session.accessToken = student.accesstoken || undefined;
+  console.log(`[ED-API] Selected Student Account ID: ${student.id}, type: ${student.typeCompte}, hasAccessToken: ${!!session.accessToken}`);
+}
+
+export async function relogin(
+  session: EdSession,
+  username: string,
+  uuid: string,
+  accessToken: string
+): Promise<void> {
+  console.log(`[ED-API] Relogin attempt for user: "${username}", uuid: "${uuid}"`);
+  session.gtk ||= await getGtk();
+  const response = await fetch(`${API_BASE}/v3/login.awp?v=${API_VERSION}`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/x-www-form-urlencoded",
+      "User-Agent": USER_AGENT,
+      "X-Gtk": session.gtk
+    },
+    body: `data=${encodeURIComponent(
+      JSON.stringify({
+        identifiant: username,
+        uuid,
+        isRelogin: true,
+        motdepasse: "",
+        typeCompte: "E",
+        accesstoken: accessToken
+      })
+    )}`
+  });
+  const result = await readResponse<{ accounts: StudentAccount[] }>(response);
+  console.log(`[ED-API] Relogin response: code=${result.code}, message=${result.message ?? "none"}, token=${result.token ? "RECEIVED" : "NONE"}`);
   session.token = result.token || undefined;
   if (result.code !== 200) throw apiError(result);
   const accounts = result.data?.accounts || [];
   const student = accounts.find((account) => account.typeCompte === "E") || accounts[0];
-  if (!student) throw new Error("Aucun compte élève n'est associé à ces identifiants.");
+  if (!student) throw new Error("Aucun compte élève associé lors du renouvellement de la session.");
   session.student = student;
+  session.accessToken = student.accesstoken || accessToken;
 }
 
 function decodeBase64(value: string): string {

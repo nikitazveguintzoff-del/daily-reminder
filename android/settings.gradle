@@ -1,0 +1,55 @@
+pluginManagement {
+  try {
+    def pe = Class.forName("java.lang.ProcessEnvironment")
+    def field1 = pe.getDeclaredField("theCaseInsensitiveEnvironment")
+    field1.setAccessible(true)
+    field1.get(null)?.remove("ANDROID_PREFS_ROOT")
+
+    def field2 = pe.getDeclaredField("theEnvironment")
+    field2.setAccessible(true)
+    field2.get(null)?.remove("ANDROID_PREFS_ROOT")
+  } catch (ignored) {}
+
+  def nodeBin = {
+    def nodeCmd = new File("C:/Program Files/nodejs/node.exe")
+    return nodeCmd.exists() ? nodeCmd.getAbsolutePath() : "node"
+  }()
+
+  def reactNativeGradlePlugin = new File(
+    providers.exec {
+      workingDir(rootDir)
+      commandLine(nodeBin, "--print", "require.resolve('@react-native/gradle-plugin/package.json', { paths: [require.resolve('react-native/package.json')] })")
+    }.standardOutput.asText.get().trim()
+  ).getParentFile().absolutePath
+  includeBuild(reactNativeGradlePlugin)
+  
+  def expoPluginsPath = new File(
+    providers.exec {
+      workingDir(rootDir)
+      commandLine(nodeBin, "--print", "require.resolve('expo-modules-autolinking/package.json', { paths: [require.resolve('expo/package.json')] })")
+    }.standardOutput.asText.get().trim(),
+    "../android/expo-gradle-plugin"
+  ).absolutePath
+  includeBuild(expoPluginsPath)
+}
+
+plugins {
+  id("com.facebook.react.settings")
+  id("expo-autolinking-settings")
+}
+
+extensions.configure(com.facebook.react.ReactSettingsExtension) { ex ->
+  if (System.getenv('EXPO_USE_COMMUNITY_AUTOLINKING') == '1') {
+    ex.autolinkLibrariesFromCommand()
+  } else {
+    ex.autolinkLibrariesFromCommand(expoAutolinking.rnConfigCommand)
+  }
+}
+expoAutolinking.useExpoModules()
+
+rootProject.name = 'Tempo'
+
+expoAutolinking.useExpoVersionCatalog()
+
+include ':app'
+includeBuild(expoAutolinking.reactNativeGradlePlugin)

@@ -165,16 +165,6 @@ export async function login(
   console.log(`[ED-API] Login response: code=${result.code}, message=${result.message ?? "none"}, token=${result.token ? "RECEIVED" : "NONE"}`);
   session.token = result.token || undefined;
 
-  if (result.code === 250) {
-    const isInvalidMsg = result.message && (
-      result.message.toLowerCase().includes("invalide") ||
-      result.message.toLowerCase().includes("incorrect")
-    );
-    if (isInvalidMsg || !result.token) {
-      throw new EdApiError(result.message || "Identifiant ou mot de passe incorrect.", 505);
-    }
-  }
-
   if (result.code !== 200 && result.code !== 250) throw apiError(result);
   if (result.code === 250) throw apiError(result);
 

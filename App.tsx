@@ -193,7 +193,20 @@ export default function App() {
     } catch (error) {
       console.error("[APP] Auto-login failed:", (error as Error).message);
       if ((error as { code?: number })?.code === 250) {
-        setNotice("Vérification École Directe requise. Rendez-vous dans l'onglet Compte.");
+        try {
+          const securityChallenge = await fetchLoginChallenge(session);
+          setChallenge({
+            session,
+            username: userToUse.trim(),
+            password: passToUse,
+            uuid,
+            ...securityChallenge
+          });
+          setTab("compte");
+          setNotice("Une vérification École Directe est nécessaire.");
+        } catch (challengeError) {
+          setNotice(`Connexion automatique impossible : ${(challengeError as Error).message}`);
+        }
       } else {
         setNotice(`Connexion automatique impossible : ${(error as Error).message}`);
       }

@@ -26,6 +26,7 @@
         <category android:name="android.intent.category.DEFAULT"/>
         <category android:name="android.intent.category.BROWSABLE"/>
         <data android:scheme="tempo"/>
+        <data android:scheme="exp+daily-reminder"/>
       </intent-filter>
     </activity>
   </application>

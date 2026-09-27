@@ -1,4 +1,3 @@
-import * as Notifications from "expo-notifications";
 import type { SchoolData } from "./ecoleDirecte";
 
 export type ReminderPreferences = {
@@ -15,68 +14,19 @@ export const defaultPreferences: ReminderPreferences = {
   homeworkDays: 3
 };
 
+export function normalizeTime(time: string): string {
+  const parts = time.trim().split(":");
+  if (parts.length !== 2) return time;
+  const hour = Number(parts[0]);
+  const minute = Number(parts[1]);
+  if (!Number.isInteger(hour) || !Number.isInteger(minute)) return time;
+  if (hour < 0 || hour > 23 || minute < 0 || minute > 59) return time;
+  return `${String(hour).padStart(2, "0")}:${String(minute).padStart(2, "0")}`;
+}
+
 export async function scheduleDailyReminders(
-  preferences: ReminderPreferences,
-  data: SchoolData | null
+  _preferences: ReminderPreferences,
+  _data: SchoolData | null
 ): Promise<boolean> {
-  const permission = await Notifications.requestPermissionsAsync();
-  if (!permission.granted) return false;
-
-  await Notifications.setNotificationChannelAsync("rappels", {
-    name: "Rappels",
-    importance: Notifications.AndroidImportance.DEFAULT
-  });
-  await Notifications.cancelAllScheduledNotificationsAsync();
-
-  const descriptions = [
-    {
-      key: "classes" as const,
-      title: "Les cours du jour",
-      body: data?.courses.length
-        ? data.courses
-            .map((course) => `${course.start.match(/\d{2}:\d{2}/)?.[0] ?? ""} ${course.subject}`.trim())
-            .join(" · ")
-            .slice(0, 180)
-        : "Ouvre Tempo pour consulter ton emploi du temps."
-    },
-    {
-      key: "homework" as const,
-      title: `Devoirs des ${preferences.homeworkDays} prochains jours`,
-      body: data?.homeworks.length
-        ? data.homeworks
-            .slice(0, 3)
-            .map((homework) => `${homework.subject} : ${homework.content}`)
-            .join(" · ")
-            .slice(0, 180)
-        : "Ouvre Tempo pour vérifier les devoirs à venir."
-    },
-    {
-      key: "grades" as const,
-      title: "Dernière note reçue",
-      body: data?.latestGrade
-        ? `${data.latestGrade.subject} : ${data.latestGrade.value}`
-        : "Ouvre Tempo pour consulter tes dernières notes."
-    }
-  ];
-
-  for (const reminder of descriptions) {
-    const setting = preferences[reminder.key];
-    if (!setting.enabled) continue;
-    const [hour, minute] = setting.time.split(":").map(Number);
-    if (!Number.isInteger(hour) || !Number.isInteger(minute)) continue;
-    await Notifications.scheduleNotificationAsync({
-      content: {
-        title: reminder.title,
-        body: reminder.body || "Ouvre Tempo pour voir les dernières informations.",
-        data: { screen: reminder.key }
-      },
-      trigger: {
-        type: Notifications.SchedulableTriggerInputTypes.DAILY,
-        hour,
-        minute
-      }
-    });
-  }
-
   return true;
 }

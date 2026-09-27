@@ -223,6 +223,15 @@ function plainText(value: string): string {
     .trim();
 }
 
+function parseEdDate(dateStr: string): number {
+  if (!dateStr) return 0;
+  if (dateStr.includes("/")) {
+    const [day, month, year] = dateStr.split("/");
+    return new Date(`${year}-${month.padStart(2, "0")}-${day.padStart(2, "0")}T00:00:00`).getTime() || 0;
+  }
+  return new Date(dateStr).getTime() || 0;
+}
+
 export async function fetchSchoolData(
   session: EdSession,
   homeworkDays: number
@@ -248,7 +257,9 @@ export async function fetchSchoolData(
           `/v3/Eleves/${studentId}/cahierdetexte/${key}.awp`,
           "get",
           {}
-        ).then((result) => ({ key, result }));
+        )
+          .then((result) => ({ key, result }))
+          .catch(() => ({ key, result: { matieres: [] } }));
       })
     ),
     request<{
@@ -280,9 +291,11 @@ export async function fetchSchoolData(
     })
   );
 
-  const latest = [...(gradeData.notes || [])].sort((first, second) =>
-    (second.dateSaisie || second.date || "").localeCompare(first.dateSaisie || first.date || "")
-  )[0];
+  const latest = [...(gradeData.notes || [])].sort((first, second) => {
+    const timeFirst = parseEdDate(first.dateSaisie || first.date || "");
+    const timeSecond = parseEdDate(second.dateSaisie || second.date || "");
+    return timeSecond - timeFirst;
+  })[0];
 
   return {
     courses: mappedCourses,

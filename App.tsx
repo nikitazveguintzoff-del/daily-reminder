@@ -15,7 +15,6 @@ import {
 import { StatusBar } from "expo-status-bar";
 import * as Crypto from "expo-crypto";
 import * as SecureStore from "expo-secure-store";
-import * as Notifications from "expo-notifications";
 import {
   ArrowRight,
   Bell,
@@ -43,18 +42,12 @@ import {
 } from "./src/ecoleDirecte";
 import {
   defaultPreferences,
+  normalizeTime,
   scheduleDailyReminders,
   type ReminderPreferences
 } from "./src/reminders";
 
-Notifications.setNotificationHandler({
-  handleNotification: async () => ({
-    shouldShowBanner: true,
-    shouldShowList: true,
-    shouldPlaySound: false,
-    shouldSetBadge: false
-  })
-});
+
 
 type Tab = "journal" | "rappels" | "compte";
 type LoginChallenge = {
@@ -146,11 +139,13 @@ export default function App() {
     Promise.all([
       SecureStore.getItemAsync(PREFS_KEY),
       SecureStore.getItemAsync(CREDENTIALS_KEY)
-    ]).then(([savedPreferences, savedCredentials]) => {
+    ]).then(async ([savedPreferences, savedCredentials]) => {
       if (!mounted) return;
+      let activePrefs = defaultPreferences;
       if (savedPreferences) {
         try {
-          setPreferences({ ...defaultPreferences, ...JSON.parse(savedPreferences) });
+          activePrefs = { ...defaultPreferences, ...JSON.parse(savedPreferences) };
+          setPreferences(activePrefs);
         } catch {
           setPreferences(defaultPreferences);
         }
@@ -161,6 +156,9 @@ export default function App() {
           setUsername(saved.username);
           setPassword(saved.password);
           setRememberCredentials(true);
+          if (saved.username && saved.password) {
+            void performAutoLogin(saved.username, saved.password, activePrefs);
+          }
         } catch {
           void SecureStore.deleteItemAsync(CREDENTIALS_KEY);
         }
@@ -170,6 +168,34 @@ export default function App() {
       mounted = false;
     };
   }, []);
+
+  const performAutoLogin = async (
+    userToUse: string,
+    passToUse: string,
+    prefsToUse: ReminderPreferences
+  ) => {
+    setBusy(true);
+    setNotice("");
+    const session = createEdSession();
+    const uuid = (await SecureStore.getItemAsync(DEVICE_KEY)) || Crypto.randomUUID();
+    try {
+      await login(session, userToUse.trim(), passToUse, uuid);
+      sessionRef.current = session;
+      const account = session.student;
+      setAccountName([account?.prenom, account?.nom].filter(Boolean).join(" "));
+      const latestData = await fetchSchoolData(session, prefsToUse.homeworkDays);
+      setData(latestData);
+      await scheduleDailyReminders(prefsToUse, latestData).catch(() => false);
+    } catch (error) {
+      if ((error as { code?: number })?.code === 250) {
+        setNotice("Vérification École Directe requise. Rendez-vous dans l'onglet Compte.");
+      } else {
+        setNotice(`Connexion automatique impossible : ${(error as Error).message}`);
+      }
+    } finally {
+      setBusy(false);
+    }
+  };
 
   const finishConnection = async (
     session: EdSession,
@@ -297,35 +323,39 @@ export default function App() {
           setNotice("");
           void SecureStore.deleteItemAsync(CREDENTIALS_KEY);
           void SecureStore.deleteItemAsync(DEVICE_KEY);
-          void Notifications.cancelAllScheduledNotificationsAsync();
         }
       }
     ]);
   };
 
   const savePreferences = async () => {
-    const times = [preferences.classes.time, preferences.homework.time, preferences.grades.time];
+    const normalizedPrefs: ReminderPreferences = {
+      ...preferences,
+      classes: { ...preferences.classes, time: normalizeTime(preferences.classes.time) },
+      homework: { ...preferences.homework, time: normalizeTime(preferences.homework.time) },
+      grades: { ...preferences.grades, time: normalizeTime(preferences.grades.time) }
+    };
+    setPreferences(normalizedPrefs);
+    const times = [normalizedPrefs.classes.time, normalizedPrefs.homework.time, normalizedPrefs.grades.time];
     if (times.some((time) => !/^([01]\d|2[0-3]):[0-5]\d$/.test(time))) {
       setNotice("Saisis les horaires au format 07:30.");
       return;
     }
-    await SecureStore.setItemAsync(PREFS_KEY, JSON.stringify(preferences));
+    await SecureStore.setItemAsync(PREFS_KEY, JSON.stringify(normalizedPrefs));
     let latestData = data;
     let syncFailed = false;
     if (sessionRef.current) {
       try {
-        latestData = await fetchSchoolData(sessionRef.current, preferences.homeworkDays);
+        latestData = await fetchSchoolData(sessionRef.current, normalizedPrefs.homeworkDays);
         setData(latestData);
       } catch {
         latestData = null;
         syncFailed = true;
       }
     }
-    const scheduled = await scheduleDailyReminders(preferences, latestData).catch(() => false);
+    await scheduleDailyReminders(normalizedPrefs, latestData).catch(() => false);
     setNotice(
-      scheduled
-        ? `Horaires enregistrés. Les notifications sont programmées sur cet appareil.${syncFailed ? " École Directe n'a pas répondu; les rappels t'inviteront à ouvrir Tempo." : ""}`
-        : "Active les notifications dans les réglages de ton téléphone pour recevoir les rappels."
+      `Horaires enregistrés.${syncFailed ? " École Directe n'a pas répondu." : ""}`
     );
   };
 
@@ -616,10 +646,10 @@ export default function App() {
         contentContainerStyle={styles.content}
         showsVerticalScrollIndicator={false}
       >
+        {!!notice && <Text accessibilityRole="alert" style={styles.notice}>{notice}</Text>}
         {tab === "journal" && renderJournal()}
         {tab === "rappels" && renderReminders()}
         {tab === "compte" && renderAccount()}
-        {!!notice && <Text accessibilityRole="alert" style={styles.notice}>{notice}</Text>}
         {data && <Text style={styles.syncCaption}>Dernière synchro {new Date(data.syncedAt).toLocaleTimeString("fr-FR", { hour: "2-digit", minute: "2-digit" })}</Text>}
       </ScrollView>
 

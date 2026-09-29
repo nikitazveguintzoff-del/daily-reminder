@@ -1,8 +1,11 @@
 import { useEffect, useRef, useState } from "react";
 import {
   ActivityIndicator,
+  AppState,
   Alert,
+  Image,
   KeyboardAvoidingView,
+  Modal,
   Platform,
   Pressable,
   ScrollView,
@@ -13,6 +16,8 @@ import {
   View
 } from "react-native";
 import { StatusBar } from "expo-status-bar";
+import * as Notifications from "expo-notifications";
+import { SafeAreaProvider, SafeAreaView } from "react-native-safe-area-context";
 import * as Crypto from "expo-crypto";
 import * as SecureStore from "expo-secure-store";
 import {
@@ -20,6 +25,9 @@ import {
   Bell,
   BookOpen,
   CalendarDays,
+  ChevronLeft,
+  ChevronRight,
+  ChevronDown,
   Check,
   ClipboardList,
   GraduationCap,
@@ -28,16 +36,32 @@ import {
   Minus,
   Plus,
   RefreshCw,
-  UserRound
+  Settings2,
+  UserRound,
+  X
 } from "lucide-react-native";
+import { WebView } from "react-native-webview";
+import {
+  BACKGROUND_SYNC_ENABLED_KEY,
+  CREDENTIALS_KEY,
+  DEVICE_KEY,
+  PREFS_KEY,
+  disableBackgroundSync,
+  enableBackgroundSync,
+  getBackgroundSyncStatus,
+  readBackgroundSyncData,
+  type BackgroundSyncStatus
+} from "./src/backgroundSync";
 import {
   createEdSession,
   fetchLoginChallenge,
-  fetchSchoolData,
+  fetchStudentsSchoolDataWithAutoAdvance,
   login,
   relogin,
   resolveLoginChallenge,
   type EdSession,
+  type EdPupil,
+  type HomeworkItem,
   type LoginChallenge as EdLoginChallenge,
   type SchoolData
 } from "./src/ecoleDirecte";
@@ -45,9 +69,18 @@ import {
   defaultPreferences,
   normalizeTime,
   scheduleDailyReminders,
+  sendTestNotifications,
   type ReminderPreferences
 } from "./src/reminders";
 
+Notifications.setNotificationHandler({
+  handleNotification: async () => ({
+    shouldShowBanner: true,
+    shouldShowList: true,
+    shouldPlaySound: true,
+    shouldSetBadge: false
+  })
+});
 
 
 type Tab = "journal" | "rappels" | "compte";
@@ -58,22 +91,25 @@ type LoginChallenge = {
   uuid: string;
 } & EdLoginChallenge;
 
-const PREFS_KEY = "tempo-reminder-preferences";
-const CREDENTIALS_KEY = "tempo-ecole-directe-credentials";
-const DEVICE_KEY = "tempo-device-id";
-
 const tabItems: { id: Tab; label: string; Icon: typeof House }[] = [
   { id: "journal", label: "Journal", Icon: House },
   { id: "rappels", label: "Rappels", Icon: Bell },
   { id: "compte", label: "Compte", Icon: UserRound }
 ];
 
-function frenchDate(): string {
+function frenchDate(date = new Date()): string {
   return new Intl.DateTimeFormat("fr-FR", {
     weekday: "long",
     day: "numeric",
     month: "long"
-  }).format(new Date());
+  }).format(date);
+}
+
+function isToday(date: Date): boolean {
+  const today = new Date();
+  return date.getFullYear() === today.getFullYear() &&
+    date.getMonth() === today.getMonth() &&
+    date.getDate() === today.getDate();
 }
 
 function courseTime(value: string): string {
@@ -81,10 +117,34 @@ function courseTime(value: string): string {
 }
 
 function shortDate(value: string): string {
-  const date = new Date(`${value.slice(0, 10)}T12:00:00`);
+  const timestamp = dateTimestamp(value);
+  const date = new Date(timestamp);
   return Number.isNaN(date.getTime())
     ? value
     : new Intl.DateTimeFormat("fr-FR", { day: "numeric", month: "short" }).format(date);
+}
+
+function dateTimestamp(value: string): number {
+  const datePart = value.slice(0, 10);
+  if (datePart.includes("/")) {
+    const [day, month, year] = datePart.split("/");
+    return new Date(`${year}-${month.padStart(2, "0")}-${day.padStart(2, "0")}T12:00:00`).getTime();
+  }
+  return new Date(`${datePart}T12:00:00`).getTime();
+}
+
+function logLoginFailure(message: string, error: unknown, ...details: unknown[]): void {
+  const errorCode = (error as { code?: number })?.code;
+  const log = errorCode === 250 ? console.log : console.error;
+  log(message, ...details, (error as Error).message);
+}
+
+function isNewGrade(value: string): boolean {
+  const timestamp = dateTimestamp(value);
+  const startOfWindow = new Date();
+  startOfWindow.setHours(0, 0, 0, 0);
+  startOfWindow.setDate(startOfWindow.getDate() - 6);
+  return timestamp >= startOfWindow.getTime() && timestamp <= Date.now();
 }
 
 function AppButton({
@@ -122,25 +182,91 @@ function EmptyLine({ children }: { children: string }) {
   return <Text style={styles.emptyLine}>{children}</Text>;
 }
 
+function PupilHeading({ pupil, detail }: { pupil: EdPupil; detail?: string }) {
+  const [photoFailed, setPhotoFailed] = useState(false);
+  const name = [pupil.prenom, pupil.nom].filter(Boolean).join(" ") || `Élève ${pupil.id}`;
+  const photoUri = pupil.photo
+    ? pupil.photo.startsWith("//") ? `https:${pupil.photo}` : pupil.photo
+    : undefined;
+  return (
+    <View style={styles.pupilHeading}>
+      {photoUri && !photoFailed ? (
+        <Image
+          source={{
+            uri: photoUri,
+            headers: { "User-Agent": "BlocksDirecte/1.0 (iPhone; CPU iPhone OS 18_7 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148 EDMOBILE v8.0.0" }
+          }}
+          resizeMode="cover"
+          onError={() => setPhotoFailed(true)}
+          style={styles.pupilPhoto}
+        />
+      ) : (
+        <View style={[styles.pupilPhoto, styles.pupilPhotoFallback]}>
+          <UserRound size={18} color={palette.green} />
+        </View>
+      )}
+      <View style={styles.rowContent}>
+        <Text style={styles.rowTitle}>{name}</Text>
+        {!!detail && <Text style={styles.rowDetail}>{detail}</Text>}
+      </View>
+    </View>
+  );
+}
+
+function homeworkDocument(content: string): string {
+  const pageRule = content.match(/@page\s*\{[^}]*\}/i)?.[0] ?? "";
+  const body = pageRule ? content.replace(pageRule, "") : content;
+  const documentContent = /<html[\s>]/i.test(body)
+    ? body.replace(/<head\b[^>]*>/i, `$&<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=5, user-scalable=yes" /><style>${pageRule}</style>`)
+    : `<!doctype html><html><head><meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=5, user-scalable=yes" /><style>
+      body { font-family: -apple-system, BlinkMacSystemFont, sans-serif; color: #1D3330; padding: 16px; line-height: 1.5; overflow-wrap: anywhere; }
+      img, table { max-width: 100%; }
+      table { border-collapse: collapse; }
+      ${pageRule}
+    </style></head><body>${body}</body></html>`;
+  return documentContent;
+}
+
 export default function App() {
+  return (
+    <SafeAreaProvider>
+      <AppContent />
+    </SafeAreaProvider>
+  );
+}
+
+function AppContent() {
   const [tab, setTab] = useState<Tab>("journal");
+  const [selectedDay, setSelectedDay] = useState(() => {
+    const date = new Date();
+    date.setHours(12, 0, 0, 0);
+    return date;
+  });
   const [preferences, setPreferences] = useState<ReminderPreferences>(defaultPreferences);
-  const [data, setData] = useState<SchoolData | null>(null);
+  const [data, setData] = useState<SchoolData[] | null>(null);
   const [accountName, setAccountName] = useState("");
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
   const [rememberCredentials, setRememberCredentials] = useState(false);
+  const [twoFactorFactors, setTwoFactorFactors] = useState<{ cn: string; cv: string } | undefined>();
+  const [backgroundSyncEnabled, setBackgroundSyncEnabled] = useState(false);
+  const [accountSettingsOpen, setAccountSettingsOpen] = useState(false);
+  const [backgroundSyncStatus, setBackgroundSyncStatus] = useState<BackgroundSyncStatus | null>(null);
   const [challenge, setChallenge] = useState<LoginChallenge | null>(null);
   const [busy, setBusy] = useState(false);
   const [notice, setNotice] = useState("");
+  const [selectedHomework, setSelectedHomework] = useState<{ student: EdPupil; homework: HomeworkItem } | null>(null);
   const sessionRef = useRef<EdSession | null>(null);
+  const dataRef = useRef<SchoolData[] | null>(null);
+  dataRef.current = data;
 
   useEffect(() => {
     let mounted = true;
     Promise.all([
       SecureStore.getItemAsync(PREFS_KEY),
-      SecureStore.getItemAsync(CREDENTIALS_KEY)
-    ]).then(async ([savedPreferences, savedCredentials]) => {
+      SecureStore.getItemAsync(CREDENTIALS_KEY),
+      SecureStore.getItemAsync(BACKGROUND_SYNC_ENABLED_KEY)
+    ]).then(async ([savedPreferences, savedCredentials, backgroundSyncFlag]) => {
       if (!mounted) return;
       let activePrefs = defaultPreferences;
       if (savedPreferences) {
@@ -153,16 +279,29 @@ export default function App() {
       }
       if (savedCredentials) {
         try {
-          const saved = JSON.parse(savedCredentials) as { username: string; password: string };
+          const saved = JSON.parse(savedCredentials) as {
+            username: string;
+            password: string;
+            accessToken?: string;
+            accountType?: string;
+            factors?: { cn: string; cv: string };
+          };
           setUsername(saved.username);
           setPassword(saved.password);
+          setTwoFactorFactors(saved.factors);
           setRememberCredentials(true);
           if (saved.username && saved.password) {
-            void performAutoLogin(saved.username, saved.password, activePrefs);
+            void performAutoLogin(saved.username, saved.password, activePrefs, saved.factors);
           }
         } catch {
           void SecureStore.deleteItemAsync(CREDENTIALS_KEY);
         }
+      }
+      if (backgroundSyncFlag === "true") {
+        setBackgroundSyncEnabled(true);
+        void enableBackgroundSync().catch((error) => {
+          setNotice(`Synchronisation périodique indisponible : ${(error as Error).message}`);
+        });
       }
     });
     return () => {
@@ -170,28 +309,55 @@ export default function App() {
     };
   }, []);
 
+  useEffect(() => {
+    const subscription = AppState.addEventListener("change", (nextState) => {
+      if (nextState !== "active") return;
+      void Promise.all([readBackgroundSyncData(), getBackgroundSyncStatus()])
+        .then(([backgroundData, status]) => {
+          setBackgroundSyncStatus(status);
+          if (!backgroundData?.length) return;
+          const currentTimestamp = Math.max(0, ...(dataRef.current || []).map((entry) => Date.parse(entry.syncedAt) || 0));
+          const backgroundTimestamp = Math.max(...backgroundData.map((entry) => Date.parse(entry.syncedAt) || 0));
+          if (backgroundTimestamp > currentTimestamp) {
+            setData(backgroundData);
+            if (status.selectedDay) {
+              const backgroundDay = new Date(status.selectedDay);
+              if (!Number.isNaN(backgroundDay.getTime())) setSelectedDay(backgroundDay);
+            }
+          }
+        })
+        .catch((error) => console.warn("[BACKGROUND-SYNC] Could not load background status:", error));
+    });
+    return () => subscription.remove();
+  }, []);
+
   const performAutoLogin = async (
     userToUse: string,
     passToUse: string,
-    prefsToUse: ReminderPreferences
+    prefsToUse: ReminderPreferences,
+    factors?: { cn: string; cv: string }
   ) => {
     console.log("[APP] Starting auto-login...");
     setBusy(true);
     setNotice("");
     const session = createEdSession();
-    const uuid = (await SecureStore.getItemAsync(DEVICE_KEY)) || Crypto.randomUUID();
+    const savedUuid = await SecureStore.getItemAsync(DEVICE_KEY);
+    const uuid = savedUuid || Crypto.randomUUID();
+    if (!savedUuid) await SecureStore.setItemAsync(DEVICE_KEY, uuid);
     try {
-      await login(session, userToUse.trim(), passToUse, uuid);
+      await login(session, userToUse.trim(), passToUse, uuid, factors);
       sessionRef.current = session;
       const account = session.student;
       setAccountName([account?.prenom, account?.nom].filter(Boolean).join(" "));
       console.log("[APP] Auto-login succeeded. Fetching school data...");
-      const latestData = await fetchSchoolData(session, prefsToUse.homeworkDays);
+      const syncResult = await fetchStudentsSchoolDataWithAutoAdvance(session, prefsToUse.homeworkDays, selectedDay);
+      setSelectedDay(syncResult.selectedDay);
+      const latestData = syncResult.data;
       setData(latestData);
       await scheduleDailyReminders(prefsToUse, latestData).catch(() => false);
       console.log("[APP] Auto-login & sync complete!");
     } catch (error) {
-      console.error("[APP] Auto-login failed:", (error as Error).message);
+      logLoginFailure("[APP] Auto-login failed:", error);
       if ((error as { code?: number })?.code === 250) {
         try {
           const securityChallenge = await fetchLoginChallenge(session);
@@ -205,6 +371,7 @@ export default function App() {
           setTab("compte");
           setNotice("Une vérification École Directe est nécessaire.");
         } catch (challengeError) {
+          logLoginFailure("[APP] Auto-login challenge failed:", challengeError);
           setNotice(`Connexion automatique impossible : ${(challengeError as Error).message}`);
         }
       } else {
@@ -225,6 +392,7 @@ export default function App() {
     sessionRef.current = session;
     const account = session.student;
     setAccountName([account?.prenom, account?.nom].filter(Boolean).join(" "));
+    setTwoFactorFactors(session.twoFactorFactors);
     setChallenge(null);
     if (rememberCredentials) {
       await SecureStore.setItemAsync(
@@ -232,23 +400,35 @@ export default function App() {
         JSON.stringify({
           username: currentUsername,
           password: currentPassword,
-          accessToken: session.accessToken
+          accessToken: session.accessToken,
+          accountType: account?.typeCompte,
+          factors: session.twoFactorFactors
         })
       );
       await SecureStore.setItemAsync(DEVICE_KEY, uuid);
     } else {
       await SecureStore.deleteItemAsync(CREDENTIALS_KEY);
       await SecureStore.deleteItemAsync(DEVICE_KEY);
+      setTwoFactorFactors(undefined);
+      if (backgroundSyncEnabled) {
+        await disableBackgroundSync();
+        setBackgroundSyncEnabled(false);
+      }
     }
     try {
       console.log("[APP] Fetching school data after login...");
-      const latestData = await fetchSchoolData(session, preferences.homeworkDays);
+      const syncResult = await fetchStudentsSchoolDataWithAutoAdvance(session, preferences.homeworkDays, selectedDay);
+      setSelectedDay(syncResult.selectedDay);
+      const latestData = syncResult.data;
       setData(latestData);
       await scheduleDailyReminders(preferences, latestData).catch(() => false);
-      setNotice("Compte synchronisé. Les rappels utilisent ces données jusqu'à la prochaine synchronisation.");
+      const failedPupils = latestData.filter((studentData) => studentData.error);
+      setNotice(failedPupils.length
+        ? `Synchronisation partielle : ${failedPupils.map(({ student }) => student.prenom || student.nom || `élève ${student.id}`).join(", ")}.`
+        : "Compte synchronisé. Les rappels utilisent ces données jusqu'à la prochaine synchronisation.");
       console.log("[APP] Connection and initial sync completed!");
     } catch (error) {
-      console.error("[APP] Sync failed after login:", (error as Error).message);
+      logLoginFailure("[APP] Sync failed after login:", error);
       setData(null);
       await scheduleDailyReminders(preferences, null).catch(() => false);
       setNotice(`Compte connecté, mais synchronisation impossible : ${(error as Error).message}`);
@@ -267,11 +447,11 @@ export default function App() {
     const session = createEdSession();
     const uuid = (await SecureStore.getItemAsync(DEVICE_KEY)) || Crypto.randomUUID();
     try {
-      await login(session, username.trim(), password, uuid);
+      await login(session, username.trim(), password, uuid, twoFactorFactors);
       await finishConnection(session, username.trim(), password, uuid);
     } catch (error) {
-      console.error("[APP] Login failed:", (error as Error).message);
       if ((error as { code?: number })?.code === 250) {
+        console.log("[APP] Initial login requires 2FA (API code 250); fetching the security question.");
         try {
           const securityChallenge = await fetchLoginChallenge(session);
           setChallenge({
@@ -283,9 +463,11 @@ export default function App() {
           });
           setNotice("Une vérification École Directe est nécessaire.");
         } catch (challengeError) {
+          logLoginFailure("[APP] Failed to fetch the 2FA question (GET doubleauth.awp):", challengeError);
           setNotice(`Connexion impossible : ${(challengeError as Error).message}`);
         }
       } else {
+        logLoginFailure(`[APP] Initial login failed (POST login.awp, code ${(error as { code?: number }).code ?? "unknown"}):`, error);
         setNotice(`Connexion impossible : ${(error as Error).message}`);
       }
     } finally {
@@ -297,16 +479,25 @@ export default function App() {
     if (!challenge) return;
     setBusy(true);
     setNotice("");
+    let twoFactorAccepted = false;
     try {
-      console.log("[APP] Answering 2FA challenge...");
+      console.log("[APP] Submitting the selected answer (POST doubleauth.awp).");
       const factors = await resolveLoginChallenge(challenge.session, answer);
-      await login(
-        challenge.session,
-        challenge.username,
-        challenge.password,
-        challenge.uuid,
-        [factors]
-      );
+      twoFactorAccepted = true;
+      console.log("[APP] 2FA answer accepted; retrying login with the returned cn/cv factors.");
+      try {
+        await login(
+          challenge.session,
+          challenge.username,
+          challenge.password,
+          challenge.uuid,
+          factors
+        );
+      } catch (loginError) {
+        logLoginFailure(`[APP] Final login after 2FA failed (POST login.awp, code ${(loginError as { code?: number }).code ?? "unknown"}):`, loginError);
+        setNotice(`Réponse 2FA acceptée, mais la connexion finale a échoué : ${(loginError as Error).message}`);
+        return;
+      }
       await finishConnection(
         challenge.session,
         challenge.username,
@@ -314,14 +505,19 @@ export default function App() {
         challenge.uuid
       );
     } catch (error) {
-      console.error("[APP] Challenge resolution failed:", (error as Error).message);
-      setNotice(`Vérification refusée : ${(error as Error).message}`);
+      if (twoFactorAccepted) {
+        logLoginFailure("[APP] Account finalization failed after successful 2FA login:", error);
+        setNotice(`Connexion réussie, mais finalisation impossible : ${(error as Error).message}`);
+      } else {
+        logLoginFailure(`[APP] 2FA answer submission failed (POST doubleauth.awp, code ${(error as { code?: number }).code ?? "unknown"}):`, error);
+        setNotice(`Vérification refusée : ${(error as Error).message}`);
+      }
     } finally {
       setBusy(false);
     }
   };
 
-  const refresh = async () => {
+  const refresh = async (timetableDate = selectedDay) => {
     console.log("[APP] Refreshing data...");
     if (!sessionRef.current && username.trim() && password) {
       console.log("[APP] No active session, attempting connect()...");
@@ -332,37 +528,85 @@ export default function App() {
     setBusy(true);
     setNotice("");
     try {
-      const latestData = await fetchSchoolData(sessionRef.current, preferences.homeworkDays);
+      const syncResult = await fetchStudentsSchoolDataWithAutoAdvance(sessionRef.current, preferences.homeworkDays, timetableDate);
+      setSelectedDay(syncResult.selectedDay);
+      const latestData = syncResult.data;
       setData(latestData);
       await scheduleDailyReminders(preferences, latestData).catch(() => false);
-      setNotice("Synchronisation terminée.");
+      const expired = latestData.find((studentData) => studentData.errorCode === 520 || studentData.errorCode === 525);
+      if (expired) throw Object.assign(new Error(expired.error), { code: expired.errorCode });
+      const failedPupils = latestData.filter((studentData) => studentData.error);
+      setNotice(failedPupils.length
+        ? `Synchronisation partielle : ${failedPupils.map(({ student }) => student.prenom || student.nom || `élève ${student.id}`).join(", ")}.`
+        : "Synchronisation terminée.");
       console.log("[APP] Refresh complete!");
     } catch (error) {
-      console.error("[APP] Refresh error:", (error as Error).message, "Code:", (error as { code?: number })?.code);
+      logLoginFailure("[APP] Refresh error:", error, "Code:", (error as { code?: number })?.code);
       const errCode = (error as { code?: number })?.code;
       if ((errCode === 520 || errCode === 525) && username.trim() && password) {
         try {
           console.log("[APP] Session expired (520/525). Re-logging in automatically...");
           const session = createEdSession();
           const uuid = (await SecureStore.getItemAsync(DEVICE_KEY)) || Crypto.randomUUID();
-          await login(session, username.trim(), password, uuid);
+          const savedCredentialsRaw = await SecureStore.getItemAsync(CREDENTIALS_KEY);
+          const savedCredentials = savedCredentialsRaw
+            ? JSON.parse(savedCredentialsRaw) as {
+                username: string;
+                password: string;
+                accessToken?: string;
+                accountType?: string;
+                factors?: { cn: string; cv: string };
+              }
+            : undefined;
+          const accessToken = savedCredentials?.accessToken || sessionRef.current?.accessToken;
+          const accountType = savedCredentials?.accountType || sessionRef.current?.student?.typeCompte || "E";
+          const factors = savedCredentials?.factors || twoFactorFactors;
+          if (accessToken) {
+            await relogin(session, username.trim(), uuid, accessToken, accountType, factors);
+          } else {
+            await login(session, username.trim(), password, uuid, factors);
+          }
           sessionRef.current = session;
           const account = session.student;
           setAccountName([account?.prenom, account?.nom].filter(Boolean).join(" "));
-          const latestData = await fetchSchoolData(session, preferences.homeworkDays);
+          setTwoFactorFactors(session.twoFactorFactors);
+          if (savedCredentialsRaw && session.accessToken) {
+            await SecureStore.setItemAsync(CREDENTIALS_KEY, JSON.stringify({
+              ...savedCredentials,
+              accessToken: session.accessToken,
+              accountType: account?.typeCompte,
+              factors: session.twoFactorFactors
+            }));
+          }
+          const syncResult = await fetchStudentsSchoolDataWithAutoAdvance(session, preferences.homeworkDays, timetableDate);
+          setSelectedDay(syncResult.selectedDay);
+          const latestData = syncResult.data;
           setData(latestData);
           await scheduleDailyReminders(preferences, latestData).catch(() => false);
+          const failedPupils = latestData.filter((studentData) => studentData.error);
+          if (failedPupils.length) {
+            setNotice(`Synchronisation partielle : ${failedPupils.map(({ student }) => student.prenom || student.nom || `élève ${student.id}`).join(", ")}.`);
+            return;
+          }
           setNotice("Session renouvelée et synchronisation terminée.");
           console.log("[APP] Automatic re-login & refresh succeeded!");
           return;
         } catch (relogErr) {
-          console.error("[APP] Automatic re-login failed:", (relogErr as Error).message);
+          logLoginFailure("[APP] Automatic re-login failed:", relogErr);
         }
       }
       setNotice(`Synchronisation impossible : ${(error as Error).message}`);
     } finally {
       setBusy(false);
     }
+  };
+
+  const navigateSchedule = async (offset: number) => {
+    const nextDay = new Date(selectedDay);
+    nextDay.setDate(nextDay.getDate() + offset);
+    nextDay.setHours(12, 0, 0, 0);
+    setSelectedDay(nextDay);
+    if (sessionRef.current) await refresh(nextDay);
   };
 
   const signOut = () => {
@@ -378,6 +622,9 @@ export default function App() {
           setUsername("");
           setPassword("");
           setRememberCredentials(false);
+          setTwoFactorFactors(undefined);
+          setBackgroundSyncEnabled(false);
+          void disableBackgroundSync().catch((error) => console.error("[BACKGROUND-SYNC] Could not unregister task:", error));
           setNotice("");
           void SecureStore.deleteItemAsync(CREDENTIALS_KEY);
           void SecureStore.deleteItemAsync(DEVICE_KEY);
@@ -404,7 +651,9 @@ export default function App() {
     let syncFailed = false;
     if (sessionRef.current) {
       try {
-        latestData = await fetchSchoolData(sessionRef.current, normalizedPrefs.homeworkDays);
+        const syncResult = await fetchStudentsSchoolDataWithAutoAdvance(sessionRef.current, normalizedPrefs.homeworkDays, selectedDay);
+        setSelectedDay(syncResult.selectedDay);
+        latestData = syncResult.data;
         setData(latestData);
       } catch {
         latestData = null;
@@ -417,12 +666,65 @@ export default function App() {
     );
   };
 
+  const testNotifications = async () => {
+    setBusy(true);
+    setNotice("");
+    try {
+      const result = await sendTestNotifications(preferences, data);
+      setNotice(!result.permissionGranted
+        ? "Autorise les notifications dans les réglages Android pour effectuer le test."
+        : result.sent === 0
+          ? "Active au moins un type de rappel pour effectuer le test."
+          : `${result.sent} notification${result.sent === 1 ? "" : "s"} de test envoyée${result.sent === 1 ? "" : "s"}.`);
+    } catch (error) {
+      setNotice(`Test des notifications impossible : ${(error as Error).message}`);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const checkBackgroundConfiguration = async () => {
+    setBusy(true);
+    try {
+      setBackgroundSyncStatus(await getBackgroundSyncStatus());
+    } catch (error) {
+      setNotice(`Vérification impossible : ${(error as Error).message}`);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const updateBackgroundSync = async (enabled: boolean) => {
+    setBusy(true);
+    try {
+      if (enabled) {
+        await enableBackgroundSync();
+        setBackgroundSyncEnabled(true);
+        setNotice("Synchronisation périodique activée. Android peut différer l’exécution pour économiser la batterie.");
+      } else {
+        await disableBackgroundSync();
+        setBackgroundSyncEnabled(false);
+        setNotice("Synchronisation périodique désactivée.");
+      }
+      setBackgroundSyncStatus(await getBackgroundSyncStatus());
+    } catch (error) {
+      setNotice(`Configuration impossible : ${(error as Error).message}`);
+      setBackgroundSyncStatus(await getBackgroundSyncStatus().catch(() => null));
+    } finally {
+      setBusy(false);
+    }
+  };
+
   const updateReminder = (key: "classes" | "homework" | "grades", update: { enabled?: boolean; time?: string }) => {
     setPreferences((current) => ({
       ...current,
       [key]: { ...current[key], ...update }
     }));
   };
+
+  const courseCount = data?.reduce((total, studentData) => total + studentData.courses.length, 0) ?? 0;
+  const homeworkCount = data?.reduce((total, studentData) => total + studentData.homeworks.length, 0) ?? 0;
+  const gradeCount = data?.filter((studentData) => studentData.latestGrade).length ?? 0;
 
   const renderJournal = () => (
     <>
@@ -431,10 +733,10 @@ export default function App() {
           <Text style={styles.heroEyebrow}>TON JOUR EN UN COUP D'OEIL</Text>
           <CalendarDays color="#B9E9D9" size={19} />
         </View>
-        <Text style={styles.heroDate}>{frenchDate()}</Text>
+        <Text style={styles.heroDate}>{frenchDate(selectedDay)}</Text>
         <Text style={styles.heroCopy}>
           {data
-            ? `${data.courses.length} cours aujourd'hui · ${data.homeworks.length} devoir${data.homeworks.length === 1 ? "" : "s"} à venir`
+            ? `${courseCount} cours ${isToday(selectedDay) ? "aujourd'hui" : `le ${frenchDate(selectedDay)}`} · ${homeworkCount} devoir${homeworkCount === 1 ? "" : "s"} à venir`
             : "Ton emploi du temps, tes devoirs et tes notes au même endroit."}
         </Text>
         {!data && (
@@ -446,7 +748,7 @@ export default function App() {
       </View>
 
       <View style={styles.sectionHeading}>
-        <Text style={styles.sectionTitle}>Aujourd'hui</Text>
+        <Text style={styles.sectionTitle}>{isToday(selectedDay) ? "Aujourd'hui" : frenchDate(selectedDay)}</Text>
         {data && (
           <Pressable accessibilityLabel="Synchroniser" onPress={() => void refresh()} style={styles.iconButton}>
             {busy ? <ActivityIndicator color={palette.green} /> : <RefreshCw size={18} color={palette.green} />}
@@ -457,38 +759,63 @@ export default function App() {
       <View style={styles.summaryRow}>
         <View style={[styles.summaryBlock, styles.summaryMint]}>
           <BookOpen size={18} color={palette.green} />
-          <Text style={styles.summaryValue}>{data ? data.courses.length : "—"}</Text>
+          <Text style={styles.summaryValue}>{data ? courseCount : "—"}</Text>
           <Text style={styles.summaryLabel}>cours</Text>
         </View>
         <View style={[styles.summaryBlock, styles.summaryPeach]}>
           <ClipboardList size={18} color={palette.coral} />
-          <Text style={styles.summaryValue}>{data ? data.homeworks.length : "—"}</Text>
+          <Text style={styles.summaryValue}>{data ? homeworkCount : "—"}</Text>
           <Text style={styles.summaryLabel}>devoirs</Text>
         </View>
         <View style={[styles.summaryBlock, styles.summaryBlue]}>
           <GraduationCap size={19} color={palette.blue} />
-          <Text style={styles.summaryValue}>{data?.latestGrade?.value ?? "—"}</Text>
-          <Text style={styles.summaryLabel}>dernière note</Text>
+          <Text style={styles.summaryValue}>{data ? gradeCount : "—"}</Text>
+          <Text style={styles.summaryLabel}>élèves avec note</Text>
         </View>
       </View>
 
       <View style={styles.sectionHeading}>
         <Text style={styles.sectionTitle}>Emploi du temps</Text>
-        <Text style={styles.sectionMeta}>{data ? `${data.courses.length} cours` : "École Directe"}</Text>
+        <View style={styles.dayNavigation}>
+          <Pressable
+            accessibilityRole="button"
+            accessibilityLabel="Jour précédent"
+            disabled={busy}
+            onPress={() => void navigateSchedule(-1)}
+            style={[styles.dayNavigationButton, busy && styles.buttonDisabled]}
+          >
+            <ChevronLeft size={18} color={palette.ink} />
+          </Pressable>
+          <Text style={styles.sectionMeta}>{new Intl.DateTimeFormat("fr-FR", { day: "numeric", month: "short" }).format(selectedDay)}</Text>
+          <Pressable
+            accessibilityRole="button"
+            accessibilityLabel="Jour suivant"
+            disabled={busy}
+            onPress={() => void navigateSchedule(1)}
+            style={[styles.dayNavigationButton, busy && styles.buttonDisabled]}
+          >
+            <ChevronRight size={18} color={palette.ink} />
+          </Pressable>
+        </View>
       </View>
       <View style={styles.listSection}>
         {!data && <EmptyLine>Connecte ton compte pour afficher les cours de la journée.</EmptyLine>}
-        {data?.courses.length === 0 && <EmptyLine>Aucun cours prévu aujourd'hui.</EmptyLine>}
-        {data?.courses.map((course, index) => (
-          <View key={`${course.subject}-${course.start}-${index}`} style={styles.listRow}>
-            <Text style={styles.rowTime}>{courseTime(course.start)}</Text>
-            <View style={styles.rowRule} />
-            <View style={styles.rowContent}>
-              <Text style={styles.rowTitle}>{course.subject}</Text>
-              <Text style={styles.rowDetail}>
-                {[course.room, course.teacher].filter(Boolean).join(" · ") || "Détail non renseigné"}
-              </Text>
-            </View>
+        {data?.map((studentData) => (
+          <View key={studentData.student.id} style={styles.pupilGroup}>
+            <PupilHeading pupil={studentData.student} detail={`${studentData.courses.length} cours`} />
+            {studentData.error ? <EmptyLine>{studentData.error}</EmptyLine> : studentData.courses.length === 0 ? <EmptyLine>Aucun cours prévu ce jour-là.</EmptyLine> :
+              studentData.courses.map((course, index) => (
+                <View key={`${course.subject}-${course.start}-${index}`} style={styles.listRow}>
+                  <Text style={styles.rowTime}>{courseTime(course.start)}</Text>
+                  <View style={styles.rowRule} />
+                  <View style={styles.rowContent}>
+                    <Text style={styles.rowTitle}>{course.subject}</Text>
+                    <Text style={styles.rowDetail}>
+                      {[course.room, course.teacher].filter(Boolean).join(" · ") || "Détail non renseigné"}
+                    </Text>
+                  </View>
+                </View>
+              ))}
           </View>
         ))}
       </View>
@@ -499,32 +826,76 @@ export default function App() {
       </View>
       <View style={styles.listSection}>
         {!data && <EmptyLine>Les devoirs à venir apparaîtront ici après connexion.</EmptyLine>}
-        {data?.homeworks.length === 0 && <EmptyLine>Aucun devoir sur cette période.</EmptyLine>}
-        {data?.homeworks.slice(0, 5).map((homework, index) => (
-          <View key={`${homework.subject}-${homework.dueDate}-${index}`} style={styles.homeworkRow}>
-            <View style={styles.homeworkMark} />
-            <View style={styles.rowContent}>
-              <Text style={styles.rowTitle}>{homework.subject}</Text>
-              <Text style={styles.rowDetail} numberOfLines={2}>{homework.content}</Text>
-            </View>
-            <Text style={styles.dueDate}>{shortDate(homework.dueDate)}</Text>
+        {data?.map((studentData) => (
+          <View key={studentData.student.id} style={styles.pupilGroup}>
+            <PupilHeading pupil={studentData.student} detail={`${studentData.homeworks.length} devoir${studentData.homeworks.length === 1 ? "" : "s"}`} />
+            {studentData.error ? <EmptyLine>{studentData.error}</EmptyLine> : studentData.homeworks.length === 0 ? <EmptyLine>Aucun devoir sur cette période.</EmptyLine> :
+              studentData.homeworks.map((homework, index) => (
+                <Pressable
+                  key={`${homework.subject}-${homework.dueDate}-${index}`}
+                  accessibilityRole="button"
+                  accessibilityLabel={`Ouvrir le devoir de ${homework.subject}`}
+                  onPress={() => setSelectedHomework({ student: studentData.student, homework })}
+                  style={styles.homeworkRow}
+                >
+                  <View
+                    accessibilityRole="image"
+                    accessibilityLabel={homework.done ? "Devoir fait" : "Devoir à faire"}
+                    style={[styles.homeworkMark, homework.done ? styles.homeworkDoneMark : styles.homeworkTodoMark]}
+                  />
+                  <View style={styles.rowContent}>
+                    <Text style={styles.rowTitle}>{homework.subject}</Text>
+                    <Text style={styles.rowDetail} numberOfLines={2}>{homework.preview || "Ouvrir le devoir"}</Text>
+                  </View>
+                  <Text style={[styles.homeworkStatus, homework.done ? styles.homeworkDoneText : styles.homeworkTodoText]}>
+                    {homework.done ? "Fait" : "À faire"}
+                  </Text>
+                  <Text style={styles.dueDate}>{shortDate(homework.dueDate)}</Text>
+                </Pressable>
+              ))}
           </View>
         ))}
       </View>
 
-      <View style={styles.gradeStrip}>
-        <GraduationCap size={21} color={palette.blue} />
-        <View style={styles.rowContent}>
-          <Text style={styles.rowTitle}>Dernière note reçue</Text>
-          <Text style={styles.rowDetail}>
-            {data?.latestGrade
-              ? `${data.latestGrade.subject} · ${shortDate(data.latestGrade.date)}`
-              : data
-                ? "Aucune note récente"
-                : "Connecte ton compte pour retrouver tes notes."}
-          </Text>
-        </View>
-        <Text style={styles.gradeValue}>{data?.latestGrade?.value ?? "—"}</Text>
+      <View style={styles.sectionHeading}>
+        <Text style={styles.sectionTitle}>Dernières notes</Text>
+      </View>
+      <View style={styles.listSection}>
+        {!data && <EmptyLine>Connecte ton compte pour retrouver tes notes.</EmptyLine>}
+        {data?.map((studentData) => (
+          <View key={studentData.student.id} style={styles.pupilGroup}>
+            <PupilHeading pupil={studentData.student} />
+            {studentData.error ? <EmptyLine>{studentData.error}</EmptyLine> : (
+              <>
+                <Text style={styles.groupCaption}>Matières et dernières notes</Text>
+                {studentData.grades.length === 0 ? <EmptyLine>Aucune note récente.</EmptyLine> :
+                  studentData.grades.map((grade, index) => (
+                    <View key={`${grade.subject}-${grade.date}-${index}`} style={styles.gradeRow}>
+                      <View style={styles.rowContent}>
+                        <Text style={[styles.rowTitle, isNewGrade(grade.date) && styles.newGradeTitle]}>{grade.subject}</Text>
+                        <Text style={styles.rowDetail}>{shortDate(grade.date)}</Text>
+                      </View>
+                      <Text style={[styles.gradeValue, isNewGrade(grade.date) && styles.newGradeTitle]}>{grade.value}</Text>
+                    </View>
+                  ))}
+                {studentData.competencies.length > 0 && (
+                  <>
+                    <Text style={styles.groupCaption}>Compétences</Text>
+                    {studentData.competencies.map((competence, index) => (
+                      <View key={`${competence.subject}-${competence.label}-${index}`} style={styles.competenceRow}>
+                        <View style={styles.rowContent}>
+                          <Text style={styles.rowTitle}>{competence.subject}</Text>
+                          <Text style={styles.rowDetail}>{competence.label}</Text>
+                        </View>
+                        {!!competence.value && <Text style={styles.gradeValue}>{competence.value}</Text>}
+                      </View>
+                    ))}
+                  </>
+                )}
+              </>
+            )}
+          </View>
+        ))}
       </View>
     </>
   );
@@ -591,6 +962,13 @@ export default function App() {
           Le contenu des rappels reflète la dernière synchronisation. Ouvre Journal et actualise pour le mettre à jour.
         </Text>
       </View>
+      <AppButton
+        label={busy ? "Envoi…" : "Tester les notifications"}
+        onPress={() => void testNotifications()}
+        icon={busy ? <ActivityIndicator color="#FFFFFF" /> : <Bell size={17} color="#FFFFFF" />}
+        disabled={busy}
+      />
+      <View style={{ height: 10 }} />
       <AppButton label="Enregistrer les horaires" onPress={() => void savePreferences()} icon={<Check size={17} color="#FFFFFF" />} />
     </>
   );
@@ -602,10 +980,11 @@ export default function App() {
         <Text style={styles.pageDescription}>Connexion directe à École Directe, sans serveur intermédiaire.</Text>
       </View>
       {sessionRef.current ? (
+        <>
         <View style={styles.accountPanel}>
           <View style={styles.accountBadge}><UserRound size={22} color={palette.green} /></View>
           <Text style={styles.accountName}>{accountName || "Compte connecté"}</Text>
-          <Text style={styles.accountStatus}>Synchronisé à {data ? new Date(data.syncedAt).toLocaleTimeString("fr-FR", { hour: "2-digit", minute: "2-digit" }) : "l'instant"}</Text>
+          <Text style={styles.accountStatus}>Synchronisé à {data?.[0] ? new Date(data[0].syncedAt).toLocaleTimeString("fr-FR", { hour: "2-digit", minute: "2-digit" }) : "l'instant"}</Text>
           <View style={styles.accountActions}>
             <AppButton
               label="Actualiser"
@@ -618,6 +997,86 @@ export default function App() {
             </Pressable>
           </View>
         </View>
+        {sessionRef.current.pupils?.map((pupil) => {
+          const studentData = data?.find((entry) => entry.student.id === pupil.id);
+          const className = pupil.classe?.libelle || pupil.classe?.code;
+          return (
+            <View key={pupil.id} style={styles.pupilProfile}>
+              <PupilHeading pupil={pupil} detail={className || "Élève du profil"} />
+              <Text style={styles.pupilProfileStatus}>
+                {studentData?.error || (studentData
+                  ? `${studentData.courses.length} cours · ${studentData.homeworks.length} devoirs synchronisés`
+                  : "En attente de synchronisation")}
+              </Text>
+            </View>
+          );
+        })}
+        <View style={styles.settingsMenu}>
+          <Pressable
+            accessibilityRole="button"
+            accessibilityState={{ expanded: accountSettingsOpen }}
+            onPress={() => {
+              const willOpen = !accountSettingsOpen;
+              setAccountSettingsOpen(willOpen);
+              if (willOpen) void checkBackgroundConfiguration();
+            }}
+            style={styles.settingsMenuHeader}
+          >
+            <Settings2 size={18} color={palette.green} />
+            <Text style={styles.settingsMenuTitle}>Paramètres</Text>
+            <ChevronDown size={18} color={palette.muted} />
+          </Pressable>
+          {accountSettingsOpen && (
+            <View style={styles.settingsPanel}>
+              <View style={styles.settingsToggleRow}>
+                <View style={styles.rowContent}>
+                  <Text style={styles.rowTitle}>Synchronisation périodique</Text>
+                  <Text style={styles.rowDetail}>Android tente une synchronisation environ toutes les heures.</Text>
+                </View>
+                <Switch
+                  value={backgroundSyncEnabled}
+                  onValueChange={(enabled) => void updateBackgroundSync(enabled)}
+                  disabled={busy || (!rememberCredentials && !backgroundSyncEnabled)}
+                  trackColor={{ false: "#D4DBD7", true: "#76CBB0" }}
+                  thumbColor={backgroundSyncEnabled ? palette.green : "#FFFFFF"}
+                />
+              </View>
+              {!rememberCredentials && !backgroundSyncEnabled && (
+                <Text style={styles.settingsHint}>Coche « Garder les identifiants sur cet appareil » à la connexion pour l’activer.</Text>
+              )}
+              <Text style={styles.settingsExplanation}>
+                WorkManager attend le réseau et reprend après redémarrage. Android peut différer la tâche; aucune alarme exacte ni permission batterie spéciale n’est demandée.
+              </Text>
+              <Text style={styles.settingsStatusText}>Réseau et redémarrage : gérés par WorkManager, sans demande runtime.</Text>
+              <Pressable
+                accessibilityRole="button"
+                onPress={() => void checkBackgroundConfiguration()}
+                disabled={busy}
+                style={styles.settingsCheckButton}
+              >
+                {busy ? <ActivityIndicator color={palette.green} /> : <RefreshCw size={16} color={palette.green} />}
+                <Text style={styles.settingsCheckText}>Vérifier la configuration</Text>
+              </Pressable>
+              {backgroundSyncStatus && (
+                <View style={styles.settingsStatus}>
+                  <Text style={styles.settingsStatusText}>Service arrière-plan : {backgroundSyncStatus.available ? "disponible" : "indisponible"}</Text>
+                  <Text style={styles.settingsStatusText}>Worker horaire : {backgroundSyncStatus.registered ? "enregistré" : "non enregistré"}</Text>
+                  <Text style={styles.settingsStatusText}>Identifiants sécurisés : {backgroundSyncStatus.credentialsSaved ? "présents" : "absents"}</Text>
+                  <Text style={styles.settingsStatusText}>Notifications Android : {backgroundSyncStatus.notificationsGranted ? "autorisées" : "non autorisées (facultatives)"}</Text>
+                  <Text style={styles.settingsStatusText}>
+                    Dernière exécution : {backgroundSyncStatus.lastSyncAt
+                      ? `${backgroundSyncStatus.lastSyncSucceeded ? "réussie" : "incomplète"}, ${new Date(backgroundSyncStatus.lastSyncAt).toLocaleString("fr-FR")}`
+                      : "aucune"}
+                  </Text>
+                  <Text style={styles.settingsStatusText}>
+                    Notifications émises après synchro : {backgroundSyncStatus.lastNotificationsSent ?? "—"}
+                  </Text>
+                </View>
+              )}
+            </View>
+          )}
+        </View>
+        </>
       ) : challenge ? (
         <View style={styles.loginPanel}>
           <Text style={styles.formTitle}>Vérification requise</Text>
@@ -684,11 +1143,12 @@ export default function App() {
   );
 
   return (
-    <KeyboardAvoidingView
-      style={styles.screen}
-      behavior={Platform.OS === "ios" ? "padding" : undefined}
-    >
-      <StatusBar style="dark" />
+    <SafeAreaView style={styles.screen} edges={["top", "bottom"]}>
+      <KeyboardAvoidingView
+        style={styles.appContent}
+        behavior={Platform.OS === "ios" ? "padding" : undefined}
+      >
+        <StatusBar style="dark" />
       <View style={styles.header}>
         <View style={styles.brandMark}><CalendarDays size={19} color="#FFFFFF" /></View>
         <View style={styles.brandTextWrap}>
@@ -708,8 +1168,44 @@ export default function App() {
         {tab === "journal" && renderJournal()}
         {tab === "rappels" && renderReminders()}
         {tab === "compte" && renderAccount()}
-        {data && <Text style={styles.syncCaption}>Dernière synchro {new Date(data.syncedAt).toLocaleTimeString("fr-FR", { hour: "2-digit", minute: "2-digit" })}</Text>}
+        {data?.length ? <Text style={styles.syncCaption}>Dernière synchro {new Date(data[0].syncedAt).toLocaleTimeString("fr-FR", { hour: "2-digit", minute: "2-digit" })}</Text> : null}
       </ScrollView>
+
+      <Modal
+        visible={selectedHomework !== null}
+        transparent
+        animationType="slide"
+        onRequestClose={() => setSelectedHomework(null)}
+      >
+        <View style={styles.modalBackdrop}>
+          <View style={styles.homeworkModal}>
+            <View style={styles.homeworkModalHeader}>
+              <View style={styles.rowContent}>
+                <Text style={styles.homeworkModalTitle}>{selectedHomework?.homework.subject}</Text>
+                <Text style={styles.rowDetail}>
+                  {selectedHomework && [selectedHomework.student.prenom, selectedHomework.student.nom].filter(Boolean).join(" ")} · {selectedHomework && shortDate(selectedHomework.homework.dueDate)}
+                </Text>
+              </View>
+              <Pressable
+                accessibilityRole="button"
+                accessibilityLabel="Fermer le devoir"
+                onPress={() => setSelectedHomework(null)}
+                style={styles.closeButton}
+              >
+                <X size={20} color={palette.ink} />
+              </Pressable>
+            </View>
+            {selectedHomework && (
+              <WebView
+                originWhitelist={["*"]}
+                javaScriptEnabled={false}
+                source={{ html: homeworkDocument(selectedHomework.homework.content) }}
+                style={styles.homeworkWebView}
+              />
+            )}
+          </View>
+        </View>
+      </Modal>
 
       <View style={styles.tabBar}>
         {tabItems.map(({ id, label, Icon }) => {
@@ -723,7 +1219,8 @@ export default function App() {
           );
         })}
       </View>
-    </KeyboardAvoidingView>
+      </KeyboardAvoidingView>
+    </SafeAreaView>
   );
 }
 
@@ -782,6 +1279,7 @@ const palette = {
 
 const styles = StyleSheet.create({
   screen: { flex: 1, backgroundColor: palette.background },
+  appContent: { flex: 1 },
   header: { minHeight: 74, paddingHorizontal: 21, paddingTop: Platform.OS === "android" ? 16 : 8, flexDirection: "row", alignItems: "center", backgroundColor: palette.background },
   brandMark: { width: 37, height: 37, borderRadius: 12, backgroundColor: palette.green, alignItems: "center", justifyContent: "center" },
   brandTextWrap: { marginLeft: 10, flex: 1 },
@@ -802,6 +1300,8 @@ const styles = StyleSheet.create({
   sectionHeading: { flexDirection: "row", alignItems: "center", justifyContent: "space-between", marginTop: 24, marginBottom: 10 },
   sectionTitle: { color: palette.ink, fontSize: 17, fontWeight: "700" },
   sectionMeta: { color: palette.muted, fontSize: 11, fontWeight: "600" },
+  dayNavigation: { flexDirection: "row", alignItems: "center", gap: 8 },
+  dayNavigationButton: { width: 32, height: 32, alignItems: "center", justifyContent: "center", borderRadius: 9, backgroundColor: "#E7F2ED" },
   iconButton: { width: 34, height: 34, alignItems: "center", justifyContent: "center", borderRadius: 10, backgroundColor: "#E7F2ED" },
   summaryRow: { flexDirection: "row", gap: 8 },
   summaryBlock: { flex: 1, minHeight: 103, borderRadius: 14, padding: 12, justifyContent: "space-between" },
@@ -819,10 +1319,19 @@ const styles = StyleSheet.create({
   rowDetail: { color: palette.muted, fontSize: 11, lineHeight: 16, marginTop: 3 },
   emptyLine: { color: palette.muted, fontSize: 12, lineHeight: 18, paddingVertical: 16 },
   homeworkRow: { minHeight: 67, flexDirection: "row", alignItems: "center", gap: 10, borderBottomWidth: 1, borderBottomColor: palette.line, paddingVertical: 11 },
-  homeworkMark: { width: 8, height: 8, borderRadius: 4, backgroundColor: palette.coral },
+  homeworkMark: { width: 9, height: 9, borderRadius: 5 },
+  homeworkDoneMark: { backgroundColor: palette.green },
+  homeworkTodoMark: { backgroundColor: palette.coral },
+  homeworkStatus: { fontSize: 10, fontWeight: "600" },
+  homeworkDoneText: { color: palette.green },
+  homeworkTodoText: { color: palette.coral },
+  newGradeTitle: { fontWeight: "900" },
   dueDate: { color: palette.coral, fontSize: 10, fontWeight: "700", marginLeft: 5 },
   gradeStrip: { flexDirection: "row", gap: 12, alignItems: "center", padding: 15, marginTop: 17, borderRadius: 14, borderWidth: 1, borderColor: palette.line, backgroundColor: "#FFFFFF" },
   gradeValue: { color: palette.blue, fontSize: 15, fontWeight: "800", marginLeft: 6 },
+  groupCaption: { color: palette.muted, fontSize: 10, fontWeight: "700", paddingHorizontal: 12, paddingTop: 9, textTransform: "uppercase" },
+  gradeRow: { minHeight: 54, flexDirection: "row", alignItems: "center", gap: 10, borderBottomWidth: 1, borderBottomColor: palette.line, paddingHorizontal: 12, paddingVertical: 8 },
+  competenceRow: { minHeight: 50, flexDirection: "row", alignItems: "center", gap: 10, borderBottomWidth: 1, borderBottomColor: palette.line, paddingHorizontal: 12, paddingVertical: 8 },
   pageIntro: { marginTop: 18, marginBottom: 18 },
   pageTitle: { color: palette.ink, fontSize: 27, fontWeight: "800" },
   pageDescription: { color: palette.muted, fontSize: 13, lineHeight: 19, marginTop: 6 },
@@ -845,7 +1354,30 @@ const styles = StyleSheet.create({
   accountBadge: { width: 50, height: 50, alignItems: "center", justifyContent: "center", borderRadius: 16, backgroundColor: "#E2F1EA" },
   accountName: { color: palette.ink, fontSize: 17, fontWeight: "700", marginTop: 13 },
   accountStatus: { color: palette.muted, fontSize: 11, marginTop: 5 },
+  settingsMenu: { marginTop: 12, borderWidth: 1, borderColor: palette.line, backgroundColor: "#FFFFFF" },
+  settingsMenuHeader: { minHeight: 48, flexDirection: "row", alignItems: "center", gap: 10, paddingHorizontal: 14 },
+  settingsMenuTitle: { flex: 1, color: palette.ink, fontSize: 13, fontWeight: "700" },
+  settingsPanel: { paddingHorizontal: 14, paddingBottom: 14, borderTopWidth: 1, borderTopColor: palette.line },
+  settingsToggleRow: { minHeight: 68, flexDirection: "row", alignItems: "center", gap: 10 },
+  settingsHint: { color: palette.coral, fontSize: 11, lineHeight: 16, marginBottom: 8 },
+  settingsExplanation: { color: palette.muted, fontSize: 10, lineHeight: 15, paddingVertical: 8 },
+  settingsCheckButton: { minHeight: 40, flexDirection: "row", alignItems: "center", justifyContent: "center", gap: 8, backgroundColor: "#E7F2ED" },
+  settingsCheckText: { color: palette.green, fontSize: 11, fontWeight: "700" },
+  settingsStatus: { gap: 5, paddingTop: 11 },
+  settingsStatusText: { color: palette.muted, fontSize: 10, lineHeight: 15 },
+  pupilProfile: { padding: 12, marginTop: 10, borderWidth: 1, borderColor: palette.line, backgroundColor: "#FFFFFF" },
+  pupilProfileStatus: { color: palette.muted, fontSize: 11, lineHeight: 16, marginTop: 8, marginLeft: 61 },
+  pupilGroup: { paddingTop: 10, paddingBottom: 5, borderBottomWidth: 1, borderBottomColor: palette.line },
+  pupilHeading: { minHeight: 46, flexDirection: "row", alignItems: "center", gap: 11, paddingHorizontal: 12, paddingVertical: 5 },
+  pupilPhoto: { width: 38, height: 38, borderRadius: 19, backgroundColor: "#E2F1EA" },
+  pupilPhotoFallback: { alignItems: "center", justifyContent: "center" },
   accountActions: { flexDirection: "row", alignItems: "center", gap: 10, marginTop: 19, width: "100%" },
+  modalBackdrop: { flex: 1, justifyContent: "center", padding: 16, backgroundColor: "rgba(15, 29, 25, 0.58)" },
+  homeworkModal: { height: "90%", overflow: "hidden", borderRadius: 14, backgroundColor: "#FFFFFF" },
+  homeworkModalHeader: { minHeight: 72, flexDirection: "row", alignItems: "center", gap: 12, paddingHorizontal: 16, borderBottomWidth: 1, borderBottomColor: palette.line },
+  homeworkModalTitle: { color: palette.ink, fontSize: 16, fontWeight: "700" },
+  closeButton: { width: 38, height: 38, alignItems: "center", justifyContent: "center", backgroundColor: palette.background },
+  homeworkWebView: { flex: 1, backgroundColor: "#FFFFFF" },
   logoutButton: { width: 46, height: 46, alignItems: "center", justifyContent: "center", borderRadius: 11, backgroundColor: "#F8E8E0" },
   loginPanel: { padding: 17, borderRadius: 16, borderWidth: 1, borderColor: palette.line, backgroundColor: "#FFFFFF" },
   formTitle: { color: palette.ink, fontSize: 17, fontWeight: "700" },

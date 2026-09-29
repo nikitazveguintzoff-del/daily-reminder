@@ -1,6 +1,13 @@
+import { Buffer } from "buffer";
+import { Client, Require2FA } from "@blockshub/blocksdirecte";
+
+const runtimeGlobal = globalThis as typeof globalThis & { Buffer?: typeof Buffer };
+runtimeGlobal.Buffer ??= Buffer;
+
 export type CourseItem = {
   subject: string;
   start: string;
+  end: string;
   room: string;
   teacher: string;
 };
@@ -8,7 +15,9 @@ export type CourseItem = {
 export type HomeworkItem = {
   subject: string;
   content: string;
+  preview: string;
   dueDate: string;
+  done: boolean;
 };
 
 export type GradeItem = {
@@ -17,26 +26,49 @@ export type GradeItem = {
   date: string;
 };
 
-export type SchoolData = {
-  courses: CourseItem[];
-  homeworks: HomeworkItem[];
-  latestGrade: GradeItem | null;
-  syncedAt: string;
+export type CompetenceItem = {
+  subject: string;
+  label: string;
+  value: string;
 };
 
-type StudentAccount = {
+export type EdPupil = {
   id: number;
-  typeCompte: string;
   prenom?: string;
   nom?: string;
+  photo?: string;
+  classe?: { libelle?: string; code?: string };
+};
+
+export type SchoolData = {
+  student: EdPupil;
+  courses: CourseItem[];
+  homeworks: HomeworkItem[];
+  grades: GradeItem[];
+  competencies: CompetenceItem[];
+  latestGrade: GradeItem | null;
+  syncedAt: string;
+  error?: string;
+  errorCode?: number;
+};
+
+type StudentAccount = EdPupil & {
+  typeCompte: string;
   accesstoken?: string;
+  accessToken?: string;
+  profile?: { eleves?: EdPupil[] };
 };
 
 export type EdSession = {
   gtk?: string;
   token?: string;
+  loginChallengeToken?: string;
+  client?: Client;
   student?: StudentAccount;
+  pupils?: EdPupil[];
   accessToken?: string;
+  twoFactorFactors?: { cn: string; cv: string };
+  loginResponse?: unknown;
 };
 
 export type LoginChallenge = {
@@ -52,9 +84,11 @@ type ApiResponse<T> = {
 };
 
 const API_BASE = "https://api.ecoledirecte.com";
-const API_VERSION = "4.75.0";
+const API_VERSION = "8.0.0";
 const USER_AGENT =
-  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/109.0.0.0 Safari/537.36";
+  "BlocksDirecte/1.0 (iPhone; CPU iPhone OS 18_7 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148  EDMOBILE v8.0.0";
+let requestSequence = 0;
+const requestIds = new WeakMap<Response, number>();
 
 export class EdApiError extends Error {
   constructor(message: string, readonly code: number) {
@@ -80,12 +114,56 @@ function apiError(response: ApiResponse<unknown>): EdApiError {
   );
 }
 
-async function readResponse<T>(response: Response): Promise<ApiResponse<T>> {
-  let result: ApiResponse<T>;
+function responseHeaders(response: Response): Record<string, string> {
+  const headers: Record<string, string> = {};
+  response.headers.forEach((value, key) => {
+    headers[key] = value;
+  });
+  return headers;
+}
+
+async function fetchLogged(url: string, init: RequestInit, endpoint: string): Promise<Response> {
+  const requestId = ++requestSequence;
+  console.log(`[ED-HTTP] REQUEST #${requestId}:\n${JSON.stringify({
+    timestamp: new Date().toISOString(),
+    endpoint,
+    url,
+    method: init.method,
+    headers: init.headers,
+    body: init.body
+  }, null, 2)}`);
   try {
-    result = (await response.json()) as ApiResponse<T>;
+    const response = await fetch(url, init);
+    requestIds.set(response, requestId);
+    return response;
+  } catch (error) {
+    console.error(`[ED-HTTP] NETWORK ERROR #${requestId}:`, error);
+    throw error;
+  }
+}
+
+async function logRawResponse(response: Response, endpoint: string): Promise<string> {
+  const body = await response.text();
+  const requestId = requestIds.get(response) ?? "unknown";
+  console.log(`[ED-HTTP] RESPONSE #${requestId}:\n${JSON.stringify({
+    timestamp: new Date().toISOString(),
+    endpoint,
+    url: response.url,
+    status: response.status,
+    statusText: response.statusText,
+    headers: responseHeaders(response),
+    body
+  }, null, 2)}`);
+  return body;
+}
+
+async function readResponse<T>(response: Response, endpoint: string): Promise<ApiResponse<T>> {
+  let result: ApiResponse<T>;
+  const rawBody = await logRawResponse(response, endpoint);
+  try {
+    result = JSON.parse(rawBody) as ApiResponse<T>;
   } catch {
-    throw new Error("Réponse École Directe illisible.");
+    throw new Error(`Réponse École Directe illisible pour ${endpoint}.`);
   }
   if (!response.ok) {
     throw new Error(`École Directe ne répond pas (${response.status}).`);
@@ -99,18 +177,24 @@ async function request<T>(
   verb: "get" | "post",
   body: unknown
 ): Promise<T> {
-  console.log(`[ED-API] Request ${verb.toUpperCase()} ${path} (token=${session.token ? session.token.slice(0, 15) + "..." : "NONE"})`);
-  const response = await fetch(`${API_BASE}${path}?verbe=${verb}&v=${API_VERSION}`, {
+  const token = session.token;
+  console.log(`[ED-API] Request ${verb.toUpperCase()} ${path} (token=${token ? "PRESENT" : "NONE"})`);
+  const authenticationHeader: Record<string, string> = {};
+  if (token) {
+    authenticationHeader["X-Token"] = token;
+  }
+  const requestUrl = `${API_BASE}${path}?verbe=${verb}&v=${API_VERSION}`;
+  const response = await fetchLogged(requestUrl, {
     method: "POST",
     headers: {
       "Content-Type": "application/x-www-form-urlencoded",
       "User-Agent": USER_AGENT,
-      ...(session.token ? { "X-Token": session.token } : {})
+      ...authenticationHeader
     },
     body: `data=${encodeURIComponent(JSON.stringify(body))}`
-  });
-  const result = await readResponse<T>(response);
-  console.log(`[ED-API] Response ${path}: code=${result.code}, tokenRefreshed=${!!result.token}, message=${result.message ?? "none"}`);
+  }, `${verb.toUpperCase()} ${path}`);
+  const result = await readResponse<T>(response, `${verb.toUpperCase()} ${path}`);
+  console.log(`[ED-API] ${verb.toUpperCase()} ${path} response: code=${result.code}, tokenRefreshed=${!!result.token}, message=${result.message ?? "none"}`);
   if (result.token) {
     session.token = result.token;
   }
@@ -121,14 +205,13 @@ async function request<T>(
 async function getGtk(): Promise<string> {
   const url = `${API_BASE}/v3/login.awp?gtk=1&v=${API_VERSION}`;
   console.log(`[ED-API] Fetching GTK: ${url}`);
-  const response = await fetch(url, {
+  const response = await fetchLogged(url, {
     headers: { "User-Agent": USER_AGENT }
-  });
-  console.log(`[ED-API] GTK HTTP Status: ${response.status}`);
+  }, "GTK GET /v3/login.awp");
+  const rawBody = await logRawResponse(response, "GTK GET /v3/login.awp");
   const cookies = response.headers.get("set-cookie") || response.headers.get("set-cookie2") || "";
-  console.log(`[ED-API] GTK Raw Cookies: ${cookies}`);
   const gtk = cookies.match(/GTK=([A-Za-z0-9]+)/i)?.[1];
-  console.log(`[ED-API] Extracted GTK: ${gtk ?? "NONE"}`);
+  console.log(`[ED-API] GTK extraction: ${JSON.stringify({ status: response.status, cookies, body: rawBody, gtk }, null, 2)}`);
   if (!gtk) throw new Error("École Directe n'a pas transmis le cookie de connexion GTK.");
   return gtk;
 }
@@ -138,54 +221,79 @@ export async function login(
   username: string,
   password: string,
   uuid: string,
-  factors?: { cn: string; cv: string }[]
+  factors?: { cn: string; cv: string }
 ): Promise<void> {
-  console.log(`[ED-API] Login attempt for user: "${username}", uuid: "${uuid}"`);
-  session.gtk ||= await getGtk();
-  console.log(`[ED-API] Using GTK header: "${session.gtk}"`);
-  const response = await fetch(`${API_BASE}/v3/login.awp?v=${API_VERSION}`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/x-www-form-urlencoded",
-      "User-Agent": USER_AGENT,
-      "X-Gtk": session.gtk
-    },
-    body: `data=${encodeURIComponent(
-      JSON.stringify({
-        identifiant: username,
-        motdepasse: password,
-        isRelogin: false,
-        sesouvenirdemoi: true,
-        uuid,
-        ...(factors ? { fa: factors } : {})
-      })
-    )}`
-  });
-  const result = await readResponse<{ accounts: StudentAccount[] }>(response);
-  console.log(`[ED-API] Login response: code=${result.code}, message=${result.message ?? "none"}, token=${result.token ? "RECEIVED" : "NONE"}`);
-  session.token = result.token || undefined;
+  const client = session.client ?? new Client();
+  session.client = client;
 
-  if (result.code !== 200 && result.code !== 250) throw apiError(result);
-  if (result.code === 250) throw apiError(result);
+  let rawLoginResponse: unknown;
+  const originalFetch = globalThis.fetch;
+  const capturingFetch: typeof fetch = async (input, init) => {
+    const response = await originalFetch(input, init);
+    const requestUrl = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+    if (requestUrl.includes("/login.awp")) {
+      try {
+        rawLoginResponse = await response.clone().json();
+      } catch {
+        rawLoginResponse = undefined;
+      }
+    }
+    return response;
+  };
+  globalThis.fetch = capturingFetch;
 
-  const accounts = result.data?.accounts || [];
-  console.log(`[ED-API] Accounts received: ${accounts.length}`);
-  const student = accounts.find((account) => account.typeCompte === "E") || accounts[0];
-  if (!student) throw new Error("Aucun compte élève n'est associé à ces identifiants.");
-  session.student = student;
-  session.accessToken = student.accesstoken || undefined;
-  console.log(`[ED-API] Selected Student Account ID: ${student.id}, type: ${student.typeCompte}, hasAccessToken: ${!!session.accessToken}`);
+  try {
+    const result = await client.auth.loginUsername(
+      username,
+      password,
+      factors?.cn,
+      factors?.cv,
+      true,
+      uuid
+    );
+    session.loginResponse = rawLoginResponse ?? result;
+    const accounts = result.accounts as unknown as StudentAccount[];
+    const profileAccountIndex = accounts.findIndex((account) => account.profile?.eleves?.length);
+    const studentIndex = accounts.findIndex((account) => account.typeCompte === "E");
+    const accountIndex = profileAccountIndex >= 0 ? profileAccountIndex : studentIndex >= 0 ? studentIndex : 0;
+    const account = accounts[accountIndex];
+    if (!account) throw new Error("Aucun compte École Directe n'est associé à ces identifiants.");
+
+    const pupils = account.profile?.eleves?.filter((pupil) => pupil.id) ??
+      accounts.filter((candidate) => candidate.typeCompte === "E");
+    if (pupils.length === 0 && account.typeCompte === "E") pupils.push(account);
+    if (pupils.length === 0) throw new Error("Aucun élève n'est associé à ce profil École Directe.");
+
+    client.auth.setAccount(accountIndex);
+    session.token = result.token;
+    session.loginChallengeToken = undefined;
+    session.student = account;
+    session.pupils = pupils;
+    session.accessToken = account.accessToken || account.accesstoken;
+    session.twoFactorFactors = factors;
+  } catch (error) {
+    if (error instanceof Require2FA) {
+      session.loginChallengeToken = error.token;
+      throw new EdApiError(error.message, 250);
+    }
+    throw error;
+  } finally {
+    if (globalThis.fetch === capturingFetch) globalThis.fetch = originalFetch;
+  }
 }
 
 export async function relogin(
   session: EdSession,
   username: string,
   uuid: string,
-  accessToken: string
+  accessToken: string,
+  accountType = "E",
+  factors?: { cn: string; cv: string }
 ): Promise<void> {
-  console.log(`[ED-API] Relogin attempt for user: "${username}", uuid: "${uuid}"`);
+  console.log("[ED-API] Starting relogin attempt");
   session.gtk ||= await getGtk();
-  const response = await fetch(`${API_BASE}/v3/login.awp?v=${API_VERSION}`, {
+  const reloginUrl = `${API_BASE}/v3/login.awp?v=${API_VERSION}`;
+  const response = await fetchLogged(reloginUrl, {
     method: "POST",
     headers: {
       "Content-Type": "application/x-www-form-urlencoded",
@@ -196,22 +304,28 @@ export async function relogin(
       JSON.stringify({
         identifiant: username,
         uuid,
-        isRelogin: true,
+        isReLogin: true,
         motdepasse: "",
-        typeCompte: "E",
-        accesstoken: accessToken
+        typeCompte: accountType,
+        accesstoken: accessToken,
+        ...(factors ? { fa: [{ cn: factors.cn, cv: factors.cv }] } : {})
       })
     )}`
-  });
-  const result = await readResponse<{ accounts: StudentAccount[] }>(response);
+  }, "Relogin POST /v3/login.awp");
+  const result = await readResponse<{ accounts: StudentAccount[] }>(response, "Relogin POST /v3/login.awp");
   console.log(`[ED-API] Relogin response: code=${result.code}, message=${result.message ?? "none"}, token=${result.token ? "RECEIVED" : "NONE"}`);
   session.token = result.token || undefined;
   if (result.code !== 200) throw apiError(result);
   const accounts = result.data?.accounts || [];
-  const student = accounts.find((account) => account.typeCompte === "E") || accounts[0];
-  if (!student) throw new Error("Aucun compte élève associé lors du renouvellement de la session.");
+  const profileAccount = accounts.find((account) => account.profile?.eleves?.length);
+  const student = profileAccount || accounts.find((account) => account.typeCompte === "E") || accounts[0];
+  if (!student) throw new Error("Aucun compte associé lors du renouvellement de la session.");
   session.student = student;
-  session.accessToken = student.accesstoken || accessToken;
+  session.pupils = student.profile?.eleves?.filter((pupil) => pupil.id) ??
+    accounts.filter((account) => account.typeCompte === "E");
+  if (session.pupils.length === 0 && student.typeCompte === "E") session.pupils = [student];
+  session.accessToken = student.accesstoken || student.accessToken || accessToken;
+  session.twoFactorFactors = factors;
 }
 
 function decodeBase64(value: string): string {
@@ -240,15 +354,13 @@ function decodeBase64(value: string): string {
 }
 
 export async function fetchLoginChallenge(session: EdSession): Promise<LoginChallenge> {
-  const challenge = await request<{ question: string; propositions: string[] }>(
-    session,
-    "/v3/connexion/doubleauth.awp",
-    "get",
-    {}
-  );
+  if (!session.client || !session.loginChallengeToken) {
+    throw new EdApiError("Aucun challenge de connexion École Directe n'est actif.", 520);
+  }
+  const challenge = await session.client.auth.get2FAQuestion(session.loginChallengeToken);
   return {
-    question: decodeBase64(challenge.question),
-    options: challenge.propositions.map((value) => ({ label: decodeBase64(value), value }))
+    question: challenge.question,
+    options: challenge.propositions.map((value) => ({ label: value, value }))
   };
 }
 
@@ -256,7 +368,10 @@ export async function resolveLoginChallenge(
   session: EdSession,
   selectedOption: string
 ): Promise<{ cn: string; cv: string }> {
-  return request(session, "/v3/connexion/doubleauth.awp", "post", { choix: selectedOption });
+  if (!session.client || !session.loginChallengeToken) {
+    throw new EdApiError("Aucun challenge de connexion École Directe n'est actif.", 520);
+  }
+  return session.client.auth.send2FAQuestion(selectedOption, session.loginChallengeToken);
 }
 
 function dayKey(date: Date): string {
@@ -268,6 +383,8 @@ function dayKey(date: Date): string {
 
 function plainText(value: string): string {
   return value
+    .replace(/<(style|script)\b[^>]*>[\s\S]*?<\/\1>/gi, " ")
+    .replace(/@page\s*\{[^}]*\}/gi, " ")
     .replace(/<br\s*\/?>/gi, " ")
     .replace(/<[^>]*>/g, " ")
     .replace(/&nbsp;/gi, " ")
@@ -283,7 +400,7 @@ function plainText(value: string): string {
 function parseEdDate(dateStr: string): number {
   if (!dateStr) return 0;
   if (dateStr.includes("/")) {
-    const [day, month, year] = dateStr.split("/");
+    const [day, month, year] = dateStr.slice(0, 10).split("/");
     return new Date(`${year}-${month.padStart(2, "0")}-${day.padStart(2, "0")}T00:00:00`).getTime() || 0;
   }
   return new Date(dateStr).getTime() || 0;
@@ -291,25 +408,26 @@ function parseEdDate(dateStr: string): number {
 
 export async function fetchSchoolData(
   session: EdSession,
-  homeworkDays: number
+  homeworkDays: number,
+  student: EdPupil,
+  timetableDate = new Date()
 ): Promise<SchoolData> {
-  if (!session.student || !session.token) throw new Error("Aucun compte École Directe connecté.");
-  const studentId = session.student.id;
-  const today = new Date();
-  const todayKey = dayKey(today);
+  if (!session.token) throw new Error("Aucun compte École Directe connecté.");
+  const studentId = student.id;
+  const timetableDayKey = dayKey(timetableDate);
   const [courses, homeworkDaysData, gradeData] = await Promise.all([
-    request<Array<{ matiere?: string; text?: string; start_date?: string; salle?: string; prof?: string }>>(
+    request<Array<{ matiere?: string; text?: string; start_date?: string; end_date?: string; salle?: string; prof?: string }>>(
       session,
       `/v3/E/${studentId}/emploidutemps.awp`,
       "get",
-      { dateDebut: todayKey, dateFin: todayKey, avecTrous: false }
+      { dateDebut: timetableDayKey, dateFin: timetableDayKey, avecTrous: false }
     ),
     Promise.all(
       Array.from({ length: homeworkDays }, (_, offset) => {
-        const date = new Date(today);
-        date.setDate(today.getDate() + offset);
+        const date = new Date(timetableDate);
+        date.setDate(timetableDate.getDate() + offset);
         const key = dayKey(date);
-        return request<{ matieres?: { matiere?: string; aFaire?: { contenu?: string } }[] }>(
+        return request<{ matieres?: { matiere?: string; effectue?: boolean; aFaire?: { contenu?: string; effectue?: boolean } }[] }>(
           session,
           `/v3/Eleves/${studentId}/cahierdetexte/${key}.awp`,
           "get",
@@ -326,7 +444,10 @@ export async function fetchSchoolData(
         noteSur?: string;
         dateSaisie?: string;
         date?: string;
+        elementsProgramme?: CompetenceItem[];
+        elementsProg?: CompetenceItem[];
       }[];
+      LSUN?: Record<string, CompetenceItem[]>;
     }>(session, `/v3/eleves/${studentId}/notes.awp`, "get", {
       anneeScolaire: ""
     })
@@ -335,35 +456,139 @@ export async function fetchSchoolData(
   const mappedCourses = courses.map((course) => ({
     subject: course.matiere || course.text || "Cours",
     start: course.start_date || "",
+    end: course.end_date || "",
     room: course.salle || "",
     teacher: course.prof || ""
-  }));
+  })).sort((first, second) => {
+    const firstTime = first.start.match(/(\d{2}):(\d{2})/);
+    const secondTime = second.start.match(/(\d{2}):(\d{2})/);
+    const firstMinutes = firstTime ? Number(firstTime[1]) * 60 + Number(firstTime[2]) : Number.MAX_SAFE_INTEGER;
+    const secondMinutes = secondTime ? Number(secondTime[1]) * 60 + Number(secondTime[2]) : Number.MAX_SAFE_INTEGER;
+    return firstMinutes - secondMinutes;
+  });
 
   const homeworks = homeworkDaysData.flatMap(({ key, result }) =>
     (result.matieres || []).flatMap((item) => {
-      const content = item.aFaire?.contenu ? plainText(decodeBase64(item.aFaire.contenu)) : "";
+      const content = item.aFaire?.contenu ? decodeBase64(item.aFaire.contenu) : "";
       return content
-        ? [{ subject: item.matiere || "Devoir", content, dueDate: key }]
+        ? [{
+            subject: item.matiere || "Devoir",
+            content,
+            preview: plainText(content),
+            dueDate: key,
+            done: item.aFaire?.effectue ?? item.effectue ?? false
+          }]
         : [];
     })
   );
 
-  const latest = [...(gradeData.notes || [])].sort((first, second) => {
+  const sortedNotes = [...(gradeData.notes || [])].sort((first, second) => {
     const timeFirst = parseEdDate(first.dateSaisie || first.date || "");
     const timeSecond = parseEdDate(second.dateSaisie || second.date || "");
     return timeSecond - timeFirst;
-  })[0];
+  });
+  const now = Date.now();
+  const thirtyDaysAgo = now - 30 * 24 * 60 * 60 * 1000;
+  const grades = sortedNotes.flatMap((note) => {
+    const date = note.dateSaisie || note.date || "";
+    const timestamp = parseEdDate(date);
+    if (timestamp < thirtyDaysAgo || timestamp > now) return [];
+    return [{
+      subject: note.libelleMatiere || "Note",
+      value: `${note.valeur ?? ""}${note.noteSur ? ` / ${note.noteSur}` : ""}`,
+      date
+    }];
+  });
+  const competencyRecords = [
+    ...Object.values(gradeData.LSUN || {}).flat(),
+    ...(gradeData.notes || []).flatMap((note) => [...(note.elementsProgramme || []), ...(note.elementsProg || [])])
+  ];
+  const seenCompetencies = new Set<string>();
+  const competencies = competencyRecords.flatMap((item) => {
+    const label = item.label || (item as CompetenceItem & { libelleElementProgramme?: string }).libelleElementProgramme;
+    if (!label) return [];
+    const subject = item.subject || (item as CompetenceItem & { libelleMatiere?: string }).libelleMatiere || "Compétence";
+    const rawValue = item.value ?? (item as CompetenceItem & { valeur?: string | number; afc?: string | number }).valeur ??
+      (item as CompetenceItem & { afc?: string | number }).afc;
+    const value = rawValue === undefined ? "" : String(rawValue);
+    const key = `${subject}|${label}|${value}`;
+    if (seenCompetencies.has(key)) return [];
+    seenCompetencies.add(key);
+    return [{ subject, label, value }];
+  });
 
   return {
+    student,
     courses: mappedCourses,
     homeworks,
-    latestGrade: latest
-      ? {
-          subject: latest.libelleMatiere || "Note",
-          value: `${latest.valeur || ""}${latest.noteSur ? ` / ${latest.noteSur}` : ""}`,
-          date: latest.dateSaisie || latest.date || ""
-        }
-      : null,
+    grades,
+    competencies,
+    latestGrade: grades[0] ?? null,
     syncedAt: new Date().toISOString()
   };
+}
+
+export async function fetchStudentsSchoolData(
+  session: EdSession,
+  homeworkDays: number,
+  timetableDate = new Date()
+): Promise<SchoolData[]> {
+  if (!session.token) throw new Error("Aucun compte École Directe connecté.");
+  const pupils = session.pupils ?? (session.student?.typeCompte === "E" ? [session.student] : []);
+  if (pupils.length === 0) throw new Error("Aucun élève n'est disponible dans ce profil École Directe.");
+
+  return Promise.all(pupils.map(async (student) => {
+    try {
+      return await fetchSchoolData(session, homeworkDays, student, timetableDate);
+    } catch (error) {
+      return {
+        student,
+        courses: [],
+        homeworks: [],
+        grades: [],
+        competencies: [],
+        latestGrade: null,
+        syncedAt: new Date().toISOString(),
+        error: (error as Error).message,
+        errorCode: (error as { code?: number }).code
+      };
+    }
+  }));
+}
+
+function courseEndTimestamp(value: string): number {
+  const match = value.match(/^(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2})/);
+  if (!match) return 0;
+  return new Date(
+    Number(match[1]),
+    Number(match[2]) - 1,
+    Number(match[3]),
+    Number(match[4]),
+    Number(match[5])
+  ).getTime();
+}
+
+export async function fetchStudentsSchoolDataWithAutoAdvance(
+  session: EdSession,
+  homeworkDays: number,
+  timetableDate: Date
+): Promise<{ data: SchoolData[]; selectedDay: Date }> {
+  const selectedDay = new Date(timetableDate);
+  selectedDay.setHours(12, 0, 0, 0);
+  let data = await fetchStudentsSchoolData(session, homeworkDays, selectedDay);
+  const now = new Date();
+  const isCurrentDay = selectedDay.getFullYear() === now.getFullYear() &&
+    selectedDay.getMonth() === now.getMonth() &&
+    selectedDay.getDate() === now.getDate();
+  if (!isCurrentDay || data.length === 0 || data.some((student) => student.error)) {
+    return { data, selectedDay };
+  }
+
+  const courseEnds = data.flatMap((student) => student.courses.map((course) => courseEndTimestamp(course.end)));
+  const lastCourseEnd = Math.max(0, ...courseEnds);
+  if (lastCourseEnd === 0 || lastCourseEnd > Date.now()) return { data, selectedDay };
+
+  selectedDay.setDate(selectedDay.getDate() + 1);
+  data = await fetchStudentsSchoolData(session, homeworkDays, selectedDay);
+  return { data, selectedDay };
 }

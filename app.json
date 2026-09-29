@@ -6,16 +6,36 @@
     "orientation": "portrait",
     "scheme": "tempo",
     "userInterfaceStyle": "light",
+    "icon": "./assets/tempo-icon.png",
     "ios": {
       "supportsTablet": true,
       "bundleIdentifier": "fr.dailyreminder.tempo"
     },
     "android": {
-      "package": "fr.dailyreminder.tempo"
+      "package": "fr.dailyreminder.tempo",
+      "permissions": [
+        "android.permission.SCHEDULE_EXACT_ALARM",
+        "android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS",
+        "android.permission.FOREGROUND_SERVICE",
+        "android.permission.FOREGROUND_SERVICE_DATA_SYNC"
+      ],
+      "adaptiveIcon": {
+        "foregroundImage": "./assets/tempo-icon.png",
+        "backgroundColor": "#0F604D"
+      }
     },
     "plugins": [
       "expo-secure-store",
-      "expo-status-bar"
+      "expo-status-bar",
+      [
+        "expo-notifications",
+        {
+          "icon": "./assets/notification-icon.png",
+          "color": "#16866A",
+          "defaultChannel": "tempo-reminders"
+        }
+      ],
+      "expo-background-task"
     ]
   }
 }

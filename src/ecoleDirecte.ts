@@ -24,6 +24,7 @@ export type GradeItem = {
   subject: string;
   value: string;
   date: string;
+  classAverage?: string;
 };
 
 export type CompetenceItem = {
@@ -50,6 +51,7 @@ export type SchoolData = {
   syncedAt: string;
   error?: string;
   errorCode?: number;
+  gradesError?: string;
 };
 
 type StudentAccount = EdPupil & {
@@ -87,8 +89,6 @@ const API_BASE = "https://api.ecoledirecte.com";
 const API_VERSION = "8.0.0";
 const USER_AGENT =
   "BlocksDirecte/1.0 (iPhone; CPU iPhone OS 18_7 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148  EDMOBILE v8.0.0";
-let requestSequence = 0;
-const requestIds = new WeakMap<Response, number>();
 
 export class EdApiError extends Error {
   constructor(message: string, readonly code: number) {
@@ -114,47 +114,12 @@ function apiError(response: ApiResponse<unknown>): EdApiError {
   );
 }
 
-function responseHeaders(response: Response): Record<string, string> {
-  const headers: Record<string, string> = {};
-  response.headers.forEach((value, key) => {
-    headers[key] = value;
-  });
-  return headers;
+async function fetchLogged(url: string, init: RequestInit, _endpoint: string): Promise<Response> {
+  return fetch(url, init);
 }
 
-async function fetchLogged(url: string, init: RequestInit, endpoint: string): Promise<Response> {
-  const requestId = ++requestSequence;
-  console.log(`[ED-HTTP] REQUEST #${requestId}:\n${JSON.stringify({
-    timestamp: new Date().toISOString(),
-    endpoint,
-    url,
-    method: init.method,
-    headers: init.headers,
-    body: init.body
-  }, null, 2)}`);
-  try {
-    const response = await fetch(url, init);
-    requestIds.set(response, requestId);
-    return response;
-  } catch (error) {
-    console.error(`[ED-HTTP] NETWORK ERROR #${requestId}:`, error);
-    throw error;
-  }
-}
-
-async function logRawResponse(response: Response, endpoint: string): Promise<string> {
-  const body = await response.text();
-  const requestId = requestIds.get(response) ?? "unknown";
-  console.log(`[ED-HTTP] RESPONSE #${requestId}:\n${JSON.stringify({
-    timestamp: new Date().toISOString(),
-    endpoint,
-    url: response.url,
-    status: response.status,
-    statusText: response.statusText,
-    headers: responseHeaders(response),
-    body
-  }, null, 2)}`);
-  return body;
+async function logRawResponse(response: Response, _endpoint: string): Promise<string> {
+  return response.text();
 }
 
 async function readResponse<T>(response: Response, endpoint: string): Promise<ApiResponse<T>> {
@@ -178,7 +143,6 @@ async function request<T>(
   body: unknown
 ): Promise<T> {
   const token = session.token;
-  console.log(`[ED-API] Request ${verb.toUpperCase()} ${path} (token=${token ? "PRESENT" : "NONE"})`);
   const authenticationHeader: Record<string, string> = {};
   if (token) {
     authenticationHeader["X-Token"] = token;
@@ -194,7 +158,6 @@ async function request<T>(
     body: `data=${encodeURIComponent(JSON.stringify(body))}`
   }, `${verb.toUpperCase()} ${path}`);
   const result = await readResponse<T>(response, `${verb.toUpperCase()} ${path}`);
-  console.log(`[ED-API] ${verb.toUpperCase()} ${path} response: code=${result.code}, tokenRefreshed=${!!result.token}, message=${result.message ?? "none"}`);
   if (result.token) {
     session.token = result.token;
   }
@@ -204,14 +167,12 @@ async function request<T>(
 
 async function getGtk(): Promise<string> {
   const url = `${API_BASE}/v3/login.awp?gtk=1&v=${API_VERSION}`;
-  console.log(`[ED-API] Fetching GTK: ${url}`);
   const response = await fetchLogged(url, {
     headers: { "User-Agent": USER_AGENT }
   }, "GTK GET /v3/login.awp");
-  const rawBody = await logRawResponse(response, "GTK GET /v3/login.awp");
+  await logRawResponse(response, "GTK GET /v3/login.awp");
   const cookies = response.headers.get("set-cookie") || response.headers.get("set-cookie2") || "";
   const gtk = cookies.match(/GTK=([A-Za-z0-9]+)/i)?.[1];
-  console.log(`[ED-API] GTK extraction: ${JSON.stringify({ status: response.status, cookies, body: rawBody, gtk }, null, 2)}`);
   if (!gtk) throw new Error("École Directe n'a pas transmis le cookie de connexion GTK.");
   return gtk;
 }
@@ -226,22 +187,6 @@ export async function login(
   const client = session.client ?? new Client();
   session.client = client;
 
-  let rawLoginResponse: unknown;
-  const originalFetch = globalThis.fetch;
-  const capturingFetch: typeof fetch = async (input, init) => {
-    const response = await originalFetch(input, init);
-    const requestUrl = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
-    if (requestUrl.includes("/login.awp")) {
-      try {
-        rawLoginResponse = await response.clone().json();
-      } catch {
-        rawLoginResponse = undefined;
-      }
-    }
-    return response;
-  };
-  globalThis.fetch = capturingFetch;
-
   try {
     const result = await client.auth.loginUsername(
       username,
@@ -251,7 +196,7 @@ export async function login(
       true,
       uuid
     );
-    session.loginResponse = rawLoginResponse ?? result;
+    session.loginResponse = result;
     const accounts = result.accounts as unknown as StudentAccount[];
     const profileAccountIndex = accounts.findIndex((account) => account.profile?.eleves?.length);
     const studentIndex = accounts.findIndex((account) => account.typeCompte === "E");
@@ -272,13 +217,14 @@ export async function login(
     session.accessToken = account.accessToken || account.accesstoken;
     session.twoFactorFactors = factors;
   } catch (error) {
-    if (error instanceof Require2FA) {
-      session.loginChallengeToken = error.token;
-      throw new EdApiError(error.message, 250);
+    const is2FA = error instanceof Require2FA ||
+      (error as { name?: string })?.name === "Require2FA" ||
+      (error as { code?: number })?.code === 250;
+    if (is2FA) {
+      session.loginChallengeToken = (error as { token?: string })?.token || session.token;
+      throw new EdApiError((error as Error).message || "Une vérification de sécurité est nécessaire.", 250);
     }
     throw error;
-  } finally {
-    if (globalThis.fetch === capturingFetch) globalThis.fetch = originalFetch;
   }
 }
 
@@ -290,7 +236,6 @@ export async function relogin(
   accountType = "E",
   factors?: { cn: string; cv: string }
 ): Promise<void> {
-  console.log("[ED-API] Starting relogin attempt");
   session.gtk ||= await getGtk();
   const reloginUrl = `${API_BASE}/v3/login.awp?v=${API_VERSION}`;
   const response = await fetchLogged(reloginUrl, {
@@ -313,7 +258,6 @@ export async function relogin(
     )}`
   }, "Relogin POST /v3/login.awp");
   const result = await readResponse<{ accounts: StudentAccount[] }>(response, "Relogin POST /v3/login.awp");
-  console.log(`[ED-API] Relogin response: code=${result.code}, message=${result.message ?? "none"}, token=${result.token ? "RECEIVED" : "NONE"}`);
   session.token = result.token || undefined;
   if (result.code !== 200) throw apiError(result);
   const accounts = result.data?.accounts || [];
@@ -354,10 +298,11 @@ function decodeBase64(value: string): string {
 }
 
 export async function fetchLoginChallenge(session: EdSession): Promise<LoginChallenge> {
-  if (!session.client || !session.loginChallengeToken) {
+  const challengeToken = session.loginChallengeToken || session.token;
+  if (!session.client || !challengeToken) {
     throw new EdApiError("Aucun challenge de connexion École Directe n'est actif.", 520);
   }
-  const challenge = await session.client.auth.get2FAQuestion(session.loginChallengeToken);
+  const challenge = await session.client.auth.get2FAQuestion(challengeToken);
   return {
     question: challenge.question,
     options: challenge.propositions.map((value) => ({ label: value, value }))
@@ -368,10 +313,11 @@ export async function resolveLoginChallenge(
   session: EdSession,
   selectedOption: string
 ): Promise<{ cn: string; cv: string }> {
-  if (!session.client || !session.loginChallengeToken) {
+  const challengeToken = session.loginChallengeToken || session.token;
+  if (!session.client || !challengeToken) {
     throw new EdApiError("Aucun challenge de connexion École Directe n'est actif.", 520);
   }
-  return session.client.auth.send2FAQuestion(selectedOption, session.loginChallengeToken);
+  return session.client.auth.send2FAQuestion(selectedOption, challengeToken);
 }
 
 function dayKey(date: Date): string {

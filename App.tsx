@@ -20,6 +20,7 @@ import * as Notifications from "expo-notifications";
 import { SafeAreaProvider, SafeAreaView } from "react-native-safe-area-context";
 import * as Crypto from "expo-crypto";
 import * as SecureStore from "expo-secure-store";
+import * as WebBrowser from "expo-web-browser";
 import {
   ArrowRight,
   Bell,
@@ -41,6 +42,8 @@ import {
   X
 } from "lucide-react-native";
 import { WebView } from "react-native-webview";
+import { PronoteSsoModal } from "./src/PronoteSsoModal";
+import { pronoteBaseUrl, type PronoteSsoCapture } from "./src/providers/pronoteSso";
 import {
   BACKGROUND_SYNC_ENABLED_KEY,
   CREDENTIALS_KEY,
@@ -54,6 +57,7 @@ import {
 } from "./src/backgroundSync";
 import {
   createEdSession,
+  fetchSchoolData,
   fetchLoginChallenge,
   fetchStudentsSchoolDataWithAutoAdvance,
   login,
@@ -72,6 +76,37 @@ import {
   sendTestNotifications,
   type ReminderPreferences
 } from "./src/reminders";
+import {
+  connectPronoteSso,
+  fetchPronoteData,
+  fetchSkolengoData,
+  finishSkolengoLogin,
+  restorePronote,
+  restoreSkolengoLogin,
+  searchSkolengoSchools,
+  startSkolengoLogin,
+  type SkolengoLoginStart
+} from "./src/providers/schoolServices";
+import type {
+  ChildProfile,
+  DomainType,
+  ProviderAccount,
+  ProviderSession,
+  ProviderStudent,
+  ProviderType
+} from "./src/providers/types";
+
+const CHILDREN_PROFILES_KEY = "tempo-children-profiles-v3";
+const PROVIDER_ACCOUNTS_KEY = "tempo-provider-accounts-v1";
+const ACTIVE_CHILD_KEY = "tempo-active-child-id-v2";
+
+function providerTokenKey(accountId: string): string {
+  let hash = 2166136261;
+  for (const character of accountId) {
+    hash = Math.imul(hash ^ character.charCodeAt(0), 16777619);
+  }
+  return `tempo-provider-token-${(hash >>> 0).toString(16)}`;
+}
 
 Notifications.setNotificationHandler({
   handleNotification: async () => ({
@@ -185,24 +220,32 @@ function EmptyLine({ children }: { children: string }) {
 function PupilHeading({ pupil, detail }: { pupil: EdPupil; detail?: string }) {
   const [photoFailed, setPhotoFailed] = useState(false);
   const name = [pupil.prenom, pupil.nom].filter(Boolean).join(" ") || `Élève ${pupil.id}`;
-  const photoUri = pupil.photo
-    ? pupil.photo.startsWith("//") ? `https:${pupil.photo}` : pupil.photo
-    : undefined;
+
+  let photoUri: string | undefined = undefined;
+  if (pupil.photo) {
+    if (pupil.photo.startsWith("data:image") || pupil.photo.startsWith("http")) {
+      photoUri = pupil.photo;
+    } else if (pupil.photo.startsWith("//")) {
+      photoUri = `https:${pupil.photo}`;
+    } else if (/^[A-Za-z0-9+/=]+$/.test(pupil.photo.slice(0, 100))) {
+      photoUri = `data:image/jpeg;base64,${pupil.photo}`;
+    }
+  }
+
+  const initials = (pupil.prenom?.[0] || pupil.nom?.[0] || "E").toUpperCase();
+
   return (
     <View style={styles.pupilHeading}>
       {photoUri && !photoFailed ? (
         <Image
-          source={{
-            uri: photoUri,
-            headers: { "User-Agent": "BlocksDirecte/1.0 (iPhone; CPU iPhone OS 18_7 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148 EDMOBILE v8.0.0" }
-          }}
+          source={{ uri: photoUri }}
           resizeMode="cover"
           onError={() => setPhotoFailed(true)}
           style={styles.pupilPhoto}
         />
       ) : (
         <View style={[styles.pupilPhoto, styles.pupilPhotoFallback]}>
-          <UserRound size={18} color={palette.green} />
+          <Text style={styles.initialsText}>{initials}</Text>
         </View>
       )}
       <View style={styles.rowContent}>
@@ -227,6 +270,120 @@ function homeworkDocument(content: string): string {
   return documentContent;
 }
 
+function ChildProfilesBar({
+  children,
+  activeChildId,
+  onSelectChild,
+  onAddChild,
+  showAll = true
+}: {
+  children: ChildProfile[];
+  activeChildId: string | null;
+  onSelectChild: (id: string | null) => void;
+  onAddChild: () => void;
+  showAll?: boolean;
+}) {
+  return (
+    <View style={styles.childBarContainer}>
+      <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.childBarScroll}>
+        {showAll && (
+          <Pressable
+            onPress={() => onSelectChild(null)}
+            style={[
+              styles.childChip,
+              activeChildId === null && styles.childChipActive
+            ]}
+          >
+            <Text style={[styles.childChipText, activeChildId === null && styles.childChipTextActive]}>
+              Tous les élèves
+            </Text>
+          </Pressable>
+        )}
+
+        {children.map((child) => {
+          const active = activeChildId === child.id;
+          return (
+            <Pressable
+              key={child.id}
+              onPress={() => onSelectChild(child.id)}
+              style={[
+                styles.childChip,
+                active && styles.childChipActive
+              ]}
+            >
+              <UserRound size={13} color={active ? "#FFFFFF" : palette.green} />
+              <Text style={[styles.childChipText, active && styles.childChipTextActive]}>
+                {child.firstName || "Enfant"}
+              </Text>
+            </Pressable>
+          );
+        })}
+
+        {onAddChild && (
+          <Pressable onPress={onAddChild} style={styles.childChipAdd}>
+            <Plus size={13} color={palette.green} />
+            <Text style={styles.childChipAddText}>Services</Text>
+          </Pressable>
+        )}
+      </ScrollView>
+    </View>
+  );
+}
+
+function ProviderSourceSelector({
+  child,
+  accounts,
+  onChange
+}: {
+  child: ChildProfile;
+  accounts: ProviderAccount[];
+  onChange: (domain: DomainType, provider: ProviderType | null) => void;
+}) {
+  const domains: { id: DomainType; label: string }[] = [
+    { id: "courses", label: "Emploi du temps" },
+    { id: "homeworks", label: "Devoirs" },
+    { id: "grades", label: "Notes" }
+  ];
+  const providerLabels: Record<ProviderType, string> = {
+    ecoleDirecte: "École Directe",
+    skolengo: "Skolengo",
+    pronote: "Pronote"
+  };
+  const availableProviders = (Object.keys(child.links) as ProviderType[]).filter((provider) => {
+    const link = child.links[provider];
+    return !!link && accounts.some((account) => account.id === link.accountId);
+  });
+
+  return (
+    <View style={styles.childSourcesCard}>
+      {domains.map(({ id, label }) => (
+        <View key={id} style={styles.childSourceRow}>
+          <Text style={styles.childSourceLabel}>{label}</Text>
+          <View style={styles.domainChoiceRow}>
+              {[...availableProviders, null].map((provider) => {
+                const selected = child.sources[id] === provider;
+                const providerLabel = provider ? providerLabels[provider] : "Désactivé";
+                return (
+                  <Pressable
+                    key={provider}
+                    accessibilityRole="button"
+                    accessibilityState={{ selected }}
+                    onPress={() => onChange(id, provider)}
+                    style={[styles.domainChoice, selected && styles.domainChoiceSelected]}
+                  >
+                    <Text style={[styles.domainChoiceText, selected && styles.domainChoiceTextSelected]}>
+                      {providerLabel}
+                    </Text>
+                  </Pressable>
+                );
+              })}
+          </View>
+        </View>
+      ))}
+    </View>
+  );
+}
+
 export default function App() {
   return (
     <SafeAreaProvider>
@@ -237,6 +394,16 @@ export default function App() {
 
 function AppContent() {
   const [tab, setTab] = useState<Tab>("journal");
+  const [childrenProfiles, setChildrenProfiles] = useState<ChildProfile[]>([]);
+  const [providerAccounts, setProviderAccounts] = useState<ProviderAccount[]>([]);
+  const [activeChildId, setActiveChildId] = useState<string | null>(null);
+  const [selectedProvider, setSelectedProvider] = useState<ProviderType>("ecoleDirecte");
+  const [pronoteLoginOpen, setPronoteLoginOpen] = useState(false);
+  const [pronoteLoginError, setPronoteLoginError] = useState("");
+  const [pronoteSsoOpen, setPronoteSsoOpen] = useState(false);
+  const [pronoteStartUrl, setPronoteStartUrl] = useState("");
+  const [schoolSearch, setSchoolSearch] = useState("");
+  const [skolengoSchools, setSkolengoSchools] = useState<Awaited<ReturnType<typeof searchSkolengoSchools>>>([]);
   const [selectedDay, setSelectedDay] = useState(() => {
     const date = new Date();
     date.setHours(12, 0, 0, 0);
@@ -244,7 +411,6 @@ function AppContent() {
   });
   const [preferences, setPreferences] = useState<ReminderPreferences>(defaultPreferences);
   const [data, setData] = useState<SchoolData[] | null>(null);
-  const [accountName, setAccountName] = useState("");
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
   const [rememberCredentials, setRememberCredentials] = useState(false);
@@ -257,17 +423,400 @@ function AppContent() {
   const [notice, setNotice] = useState("");
   const [selectedHomework, setSelectedHomework] = useState<{ student: EdPupil; homework: HomeworkItem } | null>(null);
   const sessionRef = useRef<EdSession | null>(null);
+  const providerSessionsRef = useRef(new Map<string, ProviderSession>());
+  const providerAccountsRef = useRef(providerAccounts);
+  const childrenProfilesRef = useRef(childrenProfiles);
+  const preferencesRef = useRef(preferences);
+  const selectedDayRef = useRef(selectedDay);
+  providerAccountsRef.current = providerAccounts;
+  childrenProfilesRef.current = childrenProfiles;
+  preferencesRef.current = preferences;
+  selectedDayRef.current = selectedDay;
+
+  const activeAccountFor = (provider: ProviderType) => providerAccountsRef.current.find((account) =>
+    account.provider === provider && providerSessionsRef.current.has(account.id)
+  );
+
+  const persistProviderAccounts = async (accounts: ProviderAccount[], remember: boolean) => {
+    const metadata = accounts.map(({ refreshToken: _refreshToken, ...account }) => account);
+    await SecureStore.setItemAsync(PROVIDER_ACCOUNTS_KEY, JSON.stringify(metadata));
+    await Promise.all(accounts.map((account) => {
+      const tokenKey = providerTokenKey(account.id);
+      return remember && account.refreshToken
+        ? SecureStore.setItemAsync(tokenKey, account.refreshToken)
+        : SecureStore.deleteItemAsync(tokenKey);
+    }));
+  };
   const dataRef = useRef<SchoolData[] | null>(null);
   dataRef.current = data;
+
+  const selectActiveChild = (id: string | null) => {
+    setActiveChildId(id);
+    void SecureStore.setItemAsync(ACTIVE_CHILD_KEY, id || "");
+  };
+
+  const normalizeIdentity = (value: string) => value
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .trim()
+    .replace(/\s+/g, " ")
+    .toLocaleLowerCase("fr-FR");
+  const normalizePersonName = (value: string) => normalizeIdentity(value).split(" ").sort().join(" ");
+
+  const mergeProviderStudents = (
+    currentChildren: ChildProfile[],
+    provider: ProviderType,
+    accountId: string,
+    students: ProviderStudent[]
+  ): ChildProfile[] => {
+    let merged = [...currentChildren];
+    for (const student of students) {
+      const fullName = normalizePersonName(`${student.firstName} ${student.lastName}`);
+      const existingIndex = merged.findIndex((child) =>
+        normalizePersonName(`${child.firstName} ${child.lastName}`) === fullName &&
+        (!child.links[provider] || child.links[provider]?.accountId === accountId)
+      );
+      const existing = existingIndex >= 0 ? merged[existingIndex] : undefined;
+      const links = {
+        ...existing?.links,
+        [provider]: { accountId, studentId: student.id }
+      };
+      const sources = {
+        courses: existing?.sources.courses ?? provider,
+        homeworks: existing?.sources.homeworks ?? provider,
+        grades: existing?.sources.grades ?? provider
+      };
+      for (const domain of Object.keys(sources) as DomainType[]) {
+        const source = sources[domain];
+        if (source && !links[source]) sources[domain] = provider;
+      }
+      const nextChild: ChildProfile = {
+        id: existing?.id || `${provider}-${accountId}-${student.id}`,
+        firstName: existing?.firstName || student.firstName,
+        lastName: existing?.lastName || student.lastName,
+        className: existing?.className || student.className,
+        links,
+        sources
+      };
+      if (existingIndex >= 0) merged[existingIndex] = nextChild;
+      else merged.push(nextChild);
+    }
+    return merged;
+  };
+
+  const addProviderConnection = async (
+    account: ProviderAccount,
+    session: ProviderSession,
+    remember = rememberCredentials
+  ) => {
+    const activeAccount = activeAccountFor(account.provider);
+    if (activeAccount) {
+      const uniqueAccounts = [...new Map(providerAccountsRef.current.map((item) => [item.id, item])).values()];
+      if (uniqueAccounts.length !== providerAccountsRef.current.length) {
+        providerAccountsRef.current = uniqueAccounts;
+        setProviderAccounts(uniqueAccounts);
+        await persistProviderAccounts(uniqueAccounts, rememberCredentials);
+      }
+      setNotice(`${activeAccount.label} possède déjà une session active; elle est conservée.`);
+      return childrenProfilesRef.current;
+    }
+    const replacedAccounts = providerAccountsRef.current.filter((item) =>
+      item.provider === account.provider && item.id !== account.id
+    );
+    const replacedIds = new Set(replacedAccounts.map((item) => item.id));
+    const childrenWithoutReplacedAccount = childrenProfilesRef.current.flatMap((child) => {
+      const links = { ...child.links };
+      if (links[account.provider] && replacedIds.has(links[account.provider]!.accountId)) {
+        delete links[account.provider];
+      }
+      const availableProviders = Object.keys(links) as ProviderType[];
+      if (!availableProviders.length) return [];
+      const sources = { ...child.sources };
+      for (const domain of Object.keys(sources) as DomainType[]) {
+        const source = sources[domain];
+        if (source && !links[source]) sources[domain] = availableProviders[0];
+      }
+      return [{ ...child, links, sources }];
+    });
+    const nextAccounts = [
+      ...providerAccountsRef.current.filter((item) => item.provider !== account.provider),
+      account
+    ];
+    const nextChildren = mergeProviderStudents(
+      childrenWithoutReplacedAccount,
+      account.provider,
+      account.id,
+      account.students
+    );
+    providerSessionsRef.current.set(account.id, session);
+    for (const replacedAccount of replacedAccounts) {
+      providerSessionsRef.current.delete(replacedAccount.id);
+      await SecureStore.deleteItemAsync(providerTokenKey(replacedAccount.id));
+    }
+    providerAccountsRef.current = nextAccounts;
+    childrenProfilesRef.current = nextChildren;
+    setProviderAccounts(nextAccounts);
+    setChildrenProfiles(nextChildren);
+    if (!nextChildren.some((child) => child.id === activeChildId)) {
+      selectActiveChild(nextChildren[0]?.id || null);
+    }
+    const disabledBackgroundSync = account.provider !== "ecoleDirecte" && backgroundSyncEnabled;
+    if (disabledBackgroundSync) {
+      await disableBackgroundSync();
+      setBackgroundSyncEnabled(false);
+    }
+    await persistProviderAccounts(nextAccounts, remember);
+    await SecureStore.setItemAsync(CHILDREN_PROFILES_KEY, JSON.stringify(nextChildren));
+    setNotice(`${account.label} connecté : ${account.students.length} enfant${account.students.length === 1 ? "" : "s"} trouvé${account.students.length === 1 ? "" : "s"}.${disabledBackgroundSync ? " La synchronisation en arrière-plan a été désactivée car elle ne couvre qu’École Directe." : ""}`);
+    return nextChildren;
+  };
+
+  const changeDomainSource = async (childId: string, domain: DomainType, provider: ProviderType | null) => {
+    const nextChildren = childrenProfiles.map((child) => child.id === childId
+      ? { ...child, sources: { ...child.sources, [domain]: provider } }
+      : child);
+    setChildrenProfiles(nextChildren);
+    childrenProfilesRef.current = nextChildren;
+    await SecureStore.setItemAsync(CHILDREN_PROFILES_KEY, JSON.stringify(nextChildren));
+    const nextData = await fetchConnectedChildrenData(nextChildren);
+    setData(nextData);
+    await scheduleDailyReminders(preferences, nextData).catch(() => false);
+  };
+
+  const removeProviderAccount = async (account: ProviderAccount) => {
+    const nextAccounts = providerAccounts.filter((item) => item.id !== account.id);
+    providerSessionsRef.current.delete(account.id);
+    const nextChildren = childrenProfiles.flatMap((child) => {
+      const links = { ...child.links };
+      if (links[account.provider]?.accountId === account.id) delete links[account.provider];
+      const availableProviders = Object.keys(links) as ProviderType[];
+      if (!availableProviders.length) return [];
+      const sources = { ...child.sources };
+      for (const domain of Object.keys(sources) as DomainType[]) {
+        const source = sources[domain];
+        if (source && !links[source]) sources[domain] = availableProviders[0];
+      }
+      return [{ ...child, links, sources }];
+    });
+    providerAccountsRef.current = nextAccounts;
+    childrenProfilesRef.current = nextChildren;
+    setProviderAccounts(nextAccounts);
+    setChildrenProfiles(nextChildren);
+    if (account.provider === "ecoleDirecte" && account.username === username) {
+      sessionRef.current = null;
+      setData(null);
+      await SecureStore.deleteItemAsync(CREDENTIALS_KEY);
+      await SecureStore.deleteItemAsync(DEVICE_KEY);
+      await disableBackgroundSync();
+      setBackgroundSyncEnabled(false);
+    }
+    if (!nextChildren.some((child) => child.id === activeChildId)) {
+      selectActiveChild(nextChildren[0]?.id || null);
+    }
+    await SecureStore.deleteItemAsync(providerTokenKey(account.id));
+    await persistProviderAccounts(nextAccounts, rememberCredentials);
+    await SecureStore.setItemAsync(CHILDREN_PROFILES_KEY, JSON.stringify(nextChildren));
+    setNotice(`${account.label} déconnecté.`);
+  };
+
+  const registerEcoleDirecteConnection = async (
+    session: EdSession,
+    currentUsername: string,
+    uuid: string,
+    remember = rememberCredentials
+  ): Promise<ChildProfile[]> => {
+    const parentName = [session.student?.prenom, session.student?.nom].filter(Boolean).join(" ") || currentUsername;
+    const students = (session.pupils || []).map((pupil) => ({
+      id: String(pupil.id),
+      firstName: pupil.prenom || "",
+      lastName: pupil.nom || "",
+      className: pupil.classe?.libelle || pupil.classe?.code || "",
+      photo: pupil.photo
+    }));
+    return addProviderConnection({
+      id: `ecoleDirecte:${normalizeIdentity(currentUsername)}`,
+      provider: "ecoleDirecte",
+      username: currentUsername,
+      label: parentName,
+      parentName,
+      deviceUUID: uuid,
+      refreshToken: session.accessToken,
+      students
+    }, session, remember);
+  };
+
+  const fetchConnectedChildrenData = async (
+    childrenToFetch = childrenProfiles,
+    timetableDate = selectedDayRef.current,
+    homeworkDays = preferencesRef.current.homeworkDays
+  ): Promise<SchoolData[]> => {
+    const combined: SchoolData[] = [];
+    for (const [index, child] of childrenToFetch.entries()) {
+      const domainData: Partial<Record<ProviderType, SchoolData>> = {};
+      const errors: string[] = [];
+      const selectedProviders = [...new Set(
+        Object.values(child.sources).filter((provider): provider is ProviderType => provider !== null)
+      )];
+      for (const provider of selectedProviders) {
+        const link = child.links[provider];
+        const account = link && providerAccountsRef.current.find((item) => item.id === link.accountId);
+        const session = link && providerSessionsRef.current.get(link.accountId);
+        if (!link || !account || !session) {
+          errors.push(`${provider} n’est pas connecté.`);
+          continue;
+        }
+        try {
+          if (provider === "ecoleDirecte") {
+            const edSession = session as EdSession;
+            const pupil = edSession.pupils?.find((item) => String(item.id) === link.studentId);
+            if (!pupil) throw new Error("Élève École Directe indisponible.");
+            domainData[provider] = await fetchSchoolData(edSession, homeworkDays, pupil, timetableDate);
+          } else if (provider === "pronote") {
+            const data = await fetchPronoteData(
+              session as Extract<ProviderSession, { children: unknown }>,
+              link.studentId,
+              timetableDate,
+              homeworkDays
+            );
+            domainData[provider] = {
+              student: { id: index + 1, prenom: child.firstName, nom: child.lastName },
+              ...data,
+              latestGrade: data.grades[0] || null,
+              syncedAt: new Date().toISOString()
+            };
+          } else {
+            const data = await fetchSkolengoData(
+              session as Extract<ProviderSession, { GetTimetable: unknown }>,
+              link.studentId,
+              timetableDate,
+              homeworkDays
+            );
+            domainData[provider] = {
+              student: { id: index + 1, prenom: child.firstName, nom: child.lastName },
+              ...data,
+              latestGrade: data.grades[0] || null,
+              syncedAt: new Date().toISOString()
+            };
+          }
+        } catch (error) {
+          errors.push((error as Error).message);
+        }
+      }
+      const courses = child.sources.courses ? domainData[child.sources.courses]?.courses || [] : [];
+      const homeworks = child.sources.homeworks ? domainData[child.sources.homeworks]?.homeworks || [] : [];
+      const gradeSource = child.sources.grades ? domainData[child.sources.grades] : undefined;
+      const firstSuccessfulData = Object.values(domainData).find(Boolean);
+      combined.push({
+        student: {
+          id: index + 1,
+          prenom: child.firstName,
+          nom: child.lastName,
+          classe: { libelle: child.className }
+        },
+        courses,
+        homeworks,
+        grades: gradeSource?.grades || [],
+        competencies: gradeSource?.competencies || [],
+        latestGrade: gradeSource?.latestGrade || null,
+        gradesError: gradeSource?.gradesError,
+        syncedAt: new Date().toISOString(),
+        ...(!firstSuccessfulData && errors.length ? { error: errors.join(" ") } : {})
+      });
+    }
+    return combined;
+  };
+
+  const refreshConnectedChildren = async (timetableDate = selectedDay) => {
+    const nextData = await fetchConnectedChildrenData(childrenProfiles, timetableDate);
+    setData(nextData);
+    await scheduleDailyReminders(preferences, nextData).catch(() => false);
+    return nextData;
+  };
 
   useEffect(() => {
     let mounted = true;
     Promise.all([
       SecureStore.getItemAsync(PREFS_KEY),
       SecureStore.getItemAsync(CREDENTIALS_KEY),
-      SecureStore.getItemAsync(BACKGROUND_SYNC_ENABLED_KEY)
-    ]).then(async ([savedPreferences, savedCredentials, backgroundSyncFlag]) => {
+      SecureStore.getItemAsync(BACKGROUND_SYNC_ENABLED_KEY),
+      SecureStore.getItemAsync(CHILDREN_PROFILES_KEY),
+      SecureStore.getItemAsync(ACTIVE_CHILD_KEY),
+      SecureStore.getItemAsync(PROVIDER_ACCOUNTS_KEY)
+    ]).then(async ([savedPreferences, savedCredentials, backgroundSyncFlag, savedChildren, savedActiveChild, savedProviderAccounts]) => {
       if (!mounted) return;
+      let restoredChildren: ChildProfile[] = [];
+      if (savedChildren) {
+        try {
+          restoredChildren = JSON.parse(savedChildren) as ChildProfile[];
+        } catch {}
+      }
+      let restoredAccounts: ProviderAccount[] = [];
+      let duplicateAccountRecords = false;
+      if (savedProviderAccounts) {
+        try {
+          const savedAccounts = JSON.parse(savedProviderAccounts) as ProviderAccount[];
+          const uniqueAccounts = [...new Map(savedAccounts.map((account) => [
+            `${account.provider}:${account.id}`,
+            account
+          ])).values()];
+          duplicateAccountRecords = uniqueAccounts.length !== savedAccounts.length;
+          restoredAccounts = await Promise.all(uniqueAccounts.map(async (account) => ({
+            ...account,
+            refreshToken: await SecureStore.getItemAsync(providerTokenKey(account.id)) || undefined
+          })));
+        } catch {
+          await SecureStore.deleteItemAsync(PROVIDER_ACCOUNTS_KEY);
+        }
+      }
+      let hasRestoredSession = false;
+      for (const savedAccount of restoredAccounts) {
+        if (!savedAccount.refreshToken) continue;
+        try {
+          if (savedAccount.provider === "pronote" && savedAccount.url) {
+            const restored = await restorePronote(savedAccount.refreshToken);
+            providerSessionsRef.current.set(savedAccount.id, restored.session);
+            savedAccount.refreshToken = restored.refreshToken;
+            savedAccount.students = restored.students;
+            savedAccount.parentName = restored.parentName;
+            savedAccount.label = restored.parentName;
+          } else if (savedAccount.provider === "skolengo" && savedAccount.school) {
+            const restored = await restoreSkolengoLogin(savedAccount.refreshToken, savedAccount.school);
+            providerSessionsRef.current.set(savedAccount.id, restored.account);
+            savedAccount.refreshToken = restored.account.refreshToken;
+            savedAccount.students = restored.students;
+            savedAccount.parentName = [restored.account.firstName, restored.account.lastName].filter(Boolean).join(" ") || "Compte parent";
+            savedAccount.label = savedAccount.parentName;
+          } else {
+            continue;
+          }
+          restoredChildren = mergeProviderStudents(
+            restoredChildren,
+            savedAccount.provider,
+            savedAccount.id,
+            savedAccount.students
+          );
+          hasRestoredSession = true;
+        } catch (error) {
+          console.warn(`[APP] Could not restore ${savedAccount.label}:`, error);
+        }
+      }
+      if (!mounted) return;
+      providerAccountsRef.current = restoredAccounts;
+      childrenProfilesRef.current = restoredChildren;
+      setProviderAccounts(restoredAccounts);
+      setChildrenProfiles(restoredChildren);
+      if (savedActiveChild && restoredChildren.some((child) => child.id === savedActiveChild)) {
+        setActiveChildId(savedActiveChild);
+      } else if (restoredChildren[0]) {
+        setActiveChildId(restoredChildren[0].id);
+      }
+      if (hasRestoredSession) {
+        setRememberCredentials(true);
+        await persistProviderAccounts(restoredAccounts, true);
+        await SecureStore.setItemAsync(CHILDREN_PROFILES_KEY, JSON.stringify(restoredChildren));
+      } else if (duplicateAccountRecords) {
+        await persistProviderAccounts(restoredAccounts, restoredAccounts.some((account) => !!account.refreshToken));
+      }
       let activePrefs = defaultPreferences;
       if (savedPreferences) {
         try {
@@ -297,11 +846,33 @@ function AppContent() {
           void SecureStore.deleteItemAsync(CREDENTIALS_KEY);
         }
       }
+      if (!savedCredentials && hasRestoredSession && restoredChildren.length) {
+        try {
+          const restoredData = await fetchConnectedChildrenData(
+            restoredChildren,
+            selectedDayRef.current,
+            activePrefs.homeworkDays
+          );
+          setData(restoredData);
+          await scheduleDailyReminders(activePrefs, restoredData).catch(() => false);
+        } catch (error) {
+          setNotice(`Synchronisation impossible : ${(error as Error).message}`);
+        }
+      }
       if (backgroundSyncFlag === "true") {
-        setBackgroundSyncEnabled(true);
-        void enableBackgroundSync().catch((error) => {
-          setNotice(`Synchronisation périodique indisponible : ${(error as Error).message}`);
-        });
+        const externalSessionActive = restoredAccounts.some((account) =>
+          account.provider !== "ecoleDirecte" && providerSessionsRef.current.has(account.id)
+        );
+        if (externalSessionActive) {
+          await disableBackgroundSync();
+          setBackgroundSyncEnabled(false);
+          setNotice("La synchronisation en arrière-plan a été désactivée car elle ne couvre qu’École Directe.");
+        } else {
+          setBackgroundSyncEnabled(true);
+          void enableBackgroundSync().catch((error) => {
+            setNotice(`Synchronisation périodique indisponible : ${(error as Error).message}`);
+          });
+        }
       }
     });
     return () => {
@@ -312,6 +883,17 @@ function AppContent() {
   useEffect(() => {
     const subscription = AppState.addEventListener("change", (nextState) => {
       if (nextState !== "active") return;
+      if (providerAccountsRef.current.some((account) => account.provider !== "ecoleDirecte")) {
+        void fetchConnectedChildrenData(
+          childrenProfilesRef.current,
+          selectedDayRef.current,
+          preferencesRef.current.homeworkDays
+        ).then(async (latestData) => {
+          setData(latestData);
+          await scheduleDailyReminders(preferencesRef.current, latestData).catch(() => false);
+        }).catch((error) => console.warn("[APP] Could not refresh provider data:", error));
+        return;
+      }
       void Promise.all([readBackgroundSyncData(), getBackgroundSyncStatus()])
         .then(([backgroundData, status]) => {
           setBackgroundSyncStatus(status);
@@ -347,12 +929,11 @@ function AppContent() {
     try {
       await login(session, userToUse.trim(), passToUse, uuid, factors);
       sessionRef.current = session;
-      const account = session.student;
-      setAccountName([account?.prenom, account?.nom].filter(Boolean).join(" "));
+      const connectedChildren = await registerEcoleDirecteConnection(session, userToUse.trim(), uuid, true);
       console.log("[APP] Auto-login succeeded. Fetching school data...");
       const syncResult = await fetchStudentsSchoolDataWithAutoAdvance(session, prefsToUse.homeworkDays, selectedDay);
       setSelectedDay(syncResult.selectedDay);
-      const latestData = syncResult.data;
+      const latestData = await fetchConnectedChildrenData(connectedChildren, syncResult.selectedDay, prefsToUse.homeworkDays);
       setData(latestData);
       await scheduleDailyReminders(prefsToUse, latestData).catch(() => false);
       console.log("[APP] Auto-login & sync complete!");
@@ -389,9 +970,15 @@ function AppContent() {
     uuid: string
   ) => {
     console.log("[APP] Finishing connection...");
+    const activeAccount = activeAccountFor("ecoleDirecte");
+    if (activeAccount) {
+      setChallenge(null);
+      setNotice(`${activeAccount.label} possède déjà une session active; elle est conservée.`);
+      return;
+    }
     sessionRef.current = session;
+    const connectedChildren = await registerEcoleDirecteConnection(session, currentUsername, uuid);
     const account = session.student;
-    setAccountName([account?.prenom, account?.nom].filter(Boolean).join(" "));
     setTwoFactorFactors(session.twoFactorFactors);
     setChallenge(null);
     if (rememberCredentials) {
@@ -419,7 +1006,7 @@ function AppContent() {
       console.log("[APP] Fetching school data after login...");
       const syncResult = await fetchStudentsSchoolDataWithAutoAdvance(session, preferences.homeworkDays, selectedDay);
       setSelectedDay(syncResult.selectedDay);
-      const latestData = syncResult.data;
+      const latestData = await fetchConnectedChildrenData(connectedChildren, syncResult.selectedDay, preferences.homeworkDays);
       setData(latestData);
       await scheduleDailyReminders(preferences, latestData).catch(() => false);
       const failedPupils = latestData.filter((studentData) => studentData.error);
@@ -436,9 +1023,19 @@ function AppContent() {
     setTab("journal");
   };
 
-  const connect = async () => {
+  const connect = async (
+    credentials = { username, password },
+    reuseTwoFactorFactors = true
+  ) => {
+    const currentUsername = credentials.username.trim();
+    const currentPassword = credentials.password;
+    const activeAccount = activeAccountFor("ecoleDirecte");
+    if (activeAccount) {
+      setNotice(`${activeAccount.label} possède déjà une session active; elle est conservée.`);
+      return;
+    }
     console.log("[APP] User initiated login...");
-    if (!username.trim() || !password) {
+    if (!currentUsername || !currentPassword) {
       setNotice("Renseigne ton identifiant et ton mot de passe.");
       return;
     }
@@ -447,8 +1044,8 @@ function AppContent() {
     const session = createEdSession();
     const uuid = (await SecureStore.getItemAsync(DEVICE_KEY)) || Crypto.randomUUID();
     try {
-      await login(session, username.trim(), password, uuid, twoFactorFactors);
-      await finishConnection(session, username.trim(), password, uuid);
+      await login(session, currentUsername, currentPassword, uuid, reuseTwoFactorFactors ? twoFactorFactors : undefined);
+      await finishConnection(session, currentUsername, currentPassword, uuid);
     } catch (error) {
       if ((error as { code?: number })?.code === 250) {
         console.log("[APP] Initial login requires 2FA (API code 250); fetching the security question.");
@@ -456,8 +1053,8 @@ function AppContent() {
           const securityChallenge = await fetchLoginChallenge(session);
           setChallenge({
             session,
-            username: username.trim(),
-            password,
+            username: currentUsername,
+            password: currentPassword,
             uuid,
             ...securityChallenge
           });
@@ -470,6 +1067,130 @@ function AppContent() {
         logLoginFailure(`[APP] Initial login failed (POST login.awp, code ${(error as { code?: number }).code ?? "unknown"}):`, error);
         setNotice(`Connexion impossible : ${(error as Error).message}`);
       }
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const connectPronoteAccount = () => {
+    const activeAccount = activeAccountFor("pronote");
+    if (activeAccount) {
+      setNotice(`${activeAccount.label} possède déjà une session active; elle est conservée.`);
+      return;
+    }
+    setPronoteLoginError("");
+    setPronoteLoginOpen(true);
+  };
+
+  const startPronoteSso = () => {
+    const base = pronoteBaseUrl(pronoteStartUrl);
+    if (!base) {
+      setPronoteLoginError("Saisis l’adresse Pronote de l’établissement, de la forme https://…/pronote");
+      return;
+    }
+    setPronoteStartUrl(base);
+    setPronoteLoginError("");
+    setPronoteSsoOpen(true);
+  };
+
+  const finishPronoteLogin = async (capture: PronoteSsoCapture) => {
+    setPronoteSsoOpen(false);
+    const activeAccount = activeAccountFor("pronote");
+    if (activeAccount) {
+      setPronoteLoginOpen(false);
+      setNotice(`${activeAccount.label} possède déjà une session active; elle est conservée.`);
+      return;
+    }
+    setBusy(true);
+    setNotice("");
+    try {
+      const result = await connectPronoteSso(capture);
+      const accountId = `pronote:${normalizeIdentity(result.url)}:${normalizeIdentity(result.parentName)}`;
+      const nextChildren = await addProviderConnection({
+        id: accountId,
+        provider: "pronote",
+        username: result.parentName,
+        label: result.parentName,
+        parentName: result.parentName,
+        url: result.url,
+        refreshToken: result.refreshToken,
+        students: result.students
+      }, result.session, true);
+      setRememberCredentials(true);
+      setPronoteLoginOpen(false);
+      setTab("journal");
+      void fetchConnectedChildrenData(nextChildren).then(async (nextData) => {
+        setData(nextData);
+        await scheduleDailyReminders(preferences, nextData).catch(() => false);
+      }).catch((error) => {
+        setNotice(`Connexion enregistrée, synchronisation impossible : ${(error as Error).message}`);
+      });
+    } catch (error) {
+      setPronoteLoginError((error as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const findSkolengoSchools = async () => {
+    if (!schoolSearch.trim()) {
+      setNotice("Saisis le nom de l’établissement Skolengo.");
+      return;
+    }
+    setBusy(true);
+    setNotice("");
+    try {
+      const results = await searchSkolengoSchools(schoolSearch.trim());
+      setSkolengoSchools(results);
+      if (!results.length) setNotice("Aucun établissement trouvé.");
+    } catch (error) {
+      setNotice(`Recherche Skolengo impossible : ${(error as Error).message}`);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const connectSkolengoAccount = async (school: NonNullable<SkolengoLoginStart>["school"]) => {
+    const activeAccount = activeAccountFor("skolengo");
+    if (activeAccount) {
+      setNotice(`${activeAccount.label} possède déjà une session active; elle est conservée.`);
+      return;
+    }
+    setBusy(true);
+    setNotice("");
+    try {
+      const start = await startSkolengoLogin(school);
+      const result = await WebBrowser.openAuthSessionAsync(
+        start.flow.loginURL,
+        "skoapp-prod://sign-in-callback"
+      );
+      if (result.type !== "success" || !result.url) {
+        setNotice("Connexion Skolengo annulée.");
+        return;
+      }
+      const { account, students } = await finishSkolengoLogin(start.flow, result.url);
+      const accountId = `skolengo:${school.id}:${account.userId}`;
+      const nextChildren = await addProviderConnection({
+        id: accountId,
+        provider: "skolengo",
+        username: account.firstName,
+        label: [account.firstName, account.lastName].filter(Boolean).join(" ") || "Compte parent",
+        parentName: [account.firstName, account.lastName].filter(Boolean).join(" ") || "Compte parent",
+        schoolId: school.id,
+        schoolName: school.name,
+        emsCode: school.emsCode,
+        school,
+        refreshToken: account.refreshToken,
+        students
+      }, account);
+      const nextData = await fetchConnectedChildrenData(nextChildren);
+      setData(nextData);
+      await scheduleDailyReminders(preferences, nextData).catch(() => false);
+      setSkolengoSchools([]);
+      setSchoolSearch("");
+      setTab("journal");
+    } catch (error) {
+      setNotice(`Connexion Skolengo impossible : ${(error as Error).message}`);
     } finally {
       setBusy(false);
     }
@@ -519,15 +1240,27 @@ function AppContent() {
 
   const refresh = async (timetableDate = selectedDay) => {
     console.log("[APP] Refreshing data...");
-    if (!sessionRef.current && username.trim() && password) {
+    if (!sessionRef.current && providerAccounts.length === 0 && username.trim() && password) {
       console.log("[APP] No active session, attempting connect()...");
       await connect();
       return;
     }
-    if (!sessionRef.current) return;
+    if (!sessionRef.current && (!providerAccounts.length || !childrenProfiles.length)) return;
     setBusy(true);
     setNotice("");
     try {
+      const usesExternalProvider = childrenProfiles.some((child) =>
+        Object.values(child.sources).some((provider) => provider !== "ecoleDirecte")
+      );
+      if (!sessionRef.current || usesExternalProvider) {
+        setSelectedDay(timetableDate);
+        const latestData = await refreshConnectedChildren(timetableDate);
+        const failedChildren = latestData.filter((entry) => entry.error);
+        setNotice(failedChildren.length
+          ? `Synchronisation partielle : ${failedChildren.map(({ student }) => student.prenom || student.nom).join(", ")}.`
+          : "Synchronisation terminée.");
+        return;
+      }
       const syncResult = await fetchStudentsSchoolDataWithAutoAdvance(sessionRef.current, preferences.homeworkDays, timetableDate);
       setSelectedDay(syncResult.selectedDay);
       const latestData = syncResult.data;
@@ -567,8 +1300,13 @@ function AppContent() {
             await login(session, username.trim(), password, uuid, factors);
           }
           sessionRef.current = session;
+          const connectedChildren = await registerEcoleDirecteConnection(
+            session,
+            username.trim(),
+            uuid,
+            !!savedCredentialsRaw
+          );
           const account = session.student;
-          setAccountName([account?.prenom, account?.nom].filter(Boolean).join(" "));
           setTwoFactorFactors(session.twoFactorFactors);
           if (savedCredentialsRaw && session.accessToken) {
             await SecureStore.setItemAsync(CREDENTIALS_KEY, JSON.stringify({
@@ -580,7 +1318,7 @@ function AppContent() {
           }
           const syncResult = await fetchStudentsSchoolDataWithAutoAdvance(session, preferences.homeworkDays, timetableDate);
           setSelectedDay(syncResult.selectedDay);
-          const latestData = syncResult.data;
+          const latestData = await fetchConnectedChildrenData(connectedChildren, syncResult.selectedDay, preferences.homeworkDays);
           setData(latestData);
           await scheduleDailyReminders(preferences, latestData).catch(() => false);
           const failedPupils = latestData.filter((studentData) => studentData.error);
@@ -606,31 +1344,7 @@ function AppContent() {
     nextDay.setDate(nextDay.getDate() + offset);
     nextDay.setHours(12, 0, 0, 0);
     setSelectedDay(nextDay);
-    if (sessionRef.current) await refresh(nextDay);
-  };
-
-  const signOut = () => {
-    Alert.alert("Déconnecter ce compte ?", "Les identifiants enregistrés seront supprimés de cet appareil.", [
-      { text: "Annuler", style: "cancel" },
-      {
-        text: "Déconnecter",
-        style: "destructive",
-        onPress: () => {
-          sessionRef.current = null;
-          setData(null);
-          setAccountName("");
-          setUsername("");
-          setPassword("");
-          setRememberCredentials(false);
-          setTwoFactorFactors(undefined);
-          setBackgroundSyncEnabled(false);
-          void disableBackgroundSync().catch((error) => console.error("[BACKGROUND-SYNC] Could not unregister task:", error));
-          setNotice("");
-          void SecureStore.deleteItemAsync(CREDENTIALS_KEY);
-          void SecureStore.deleteItemAsync(DEVICE_KEY);
-        }
-      }
-    ]);
+    if (sessionRef.current || providerAccountsRef.current.length) await refresh(nextDay);
   };
 
   const savePreferences = async () => {
@@ -649,7 +1363,18 @@ function AppContent() {
     await SecureStore.setItemAsync(PREFS_KEY, JSON.stringify(normalizedPrefs));
     let latestData = data;
     let syncFailed = false;
-    if (sessionRef.current) {
+    const externalSessionActive = providerAccountsRef.current.some((account) =>
+      account.provider !== "ecoleDirecte" && providerSessionsRef.current.has(account.id)
+    );
+    if (externalSessionActive && childrenProfiles.length) {
+      try {
+        latestData = await fetchConnectedChildrenData(childrenProfiles, selectedDay, normalizedPrefs.homeworkDays);
+        setData(latestData);
+      } catch {
+        latestData = null;
+        syncFailed = true;
+      }
+    } else if (sessionRef.current) {
       try {
         const syncResult = await fetchStudentsSchoolDataWithAutoAdvance(sessionRef.current, normalizedPrefs.homeworkDays, selectedDay);
         setSelectedDay(syncResult.selectedDay);
@@ -722,12 +1447,268 @@ function AppContent() {
     }));
   };
 
-  const courseCount = data?.reduce((total, studentData) => total + studentData.courses.length, 0) ?? 0;
-  const homeworkCount = data?.reduce((total, studentData) => total + studentData.homeworks.length, 0) ?? 0;
-  const gradeCount = data?.filter((studentData) => studentData.latestGrade).length ?? 0;
+  const selectedChild = childrenProfiles.find((child) => child.id === activeChildId);
+  const normalizeName = (value: string) => value.normalize("NFD").replace(/[\u0300-\u036f]/g, "").trim().toLocaleLowerCase("fr-FR");
+  const visibleData = activeChildId
+    ? data?.filter(({ student }) => {
+        if (!selectedChild) return false;
+        const expectedName = normalizeName(`${selectedChild.firstName} ${selectedChild.lastName}`);
+        const pupilName = normalizeName([student.prenom, student.nom].filter(Boolean).join(" "));
+        return expectedName === pupilName;
+      }) ?? null
+    : data;
+  const courseCount = visibleData?.reduce((total, studentData) => total + studentData.courses.length, 0) ?? 0;
+  const homeworkCount = visibleData?.reduce((total, studentData) => total + studentData.homeworks.length, 0) ?? 0;
+  const gradeCount = visibleData?.filter((studentData) => studentData.latestGrade).length ?? 0;
+
+  const renderProviderManager = () => (
+    <View style={styles.parentSpace}>
+      <View style={styles.parentSpaceHeading}>
+        <Text style={styles.sectionTitle}>Espace parents</Text>
+        <Text style={styles.rowDetail}>Comptes et sources des données des enfants</Text>
+      </View>
+
+      {providerAccounts.map((account) => {
+        const serviceLabel = account.provider === "ecoleDirecte"
+          ? "École Directe"
+          : account.provider === "skolengo"
+            ? `Skolengo${account.schoolName ? ` · ${account.schoolName}` : ""}`
+            : "Pronote";
+        return (
+          <View key={account.id} style={styles.providerAccountRow}>
+            <View style={styles.rowContent}>
+              <Text style={styles.rowTitle}>{account.parentName || account.label}</Text>
+              <Text style={styles.rowDetail}>{serviceLabel}</Text>
+              <Text style={styles.rowDetail}>
+                {providerSessionsRef.current.has(account.id) ? "Connecté" : "À reconnecter"} · {account.students.length} enfant{account.students.length === 1 ? "" : "s"}
+              </Text>
+            </View>
+            <Pressable
+              accessibilityRole="button"
+              accessibilityLabel={`Déconnecter ${serviceLabel}`}
+              onPress={() => Alert.alert("Déconnecter ce service ?", serviceLabel, [
+                { text: "Annuler", style: "cancel" },
+                { text: "Déconnecter", style: "destructive", onPress: () => void removeProviderAccount(account) }
+              ])}
+              style={styles.providerDisconnectButton}
+            >
+              <LogOut size={16} color={palette.coral} />
+            </Pressable>
+          </View>
+        );
+      })}
+
+      <Text style={styles.inputLabel}>Ajouter un service</Text>
+      <View style={styles.serviceProviderRow}>
+        {([
+          ["ecoleDirecte", "École Directe"],
+          ["skolengo", "Skolengo"],
+          ["pronote", "Pronote"]
+        ] as [ProviderType, string][]).map(([provider, label]) => {
+          const selected = selectedProvider === provider;
+          return (
+            <Pressable
+              key={provider}
+              accessibilityRole="button"
+              accessibilityState={{ selected }}
+              onPress={() => setSelectedProvider(provider)}
+              style={[styles.serviceProviderButton, selected && styles.serviceProviderButtonSelected]}
+            >
+              <Text style={[styles.serviceProviderText, selected && styles.serviceProviderTextSelected]}>{label}</Text>
+            </Pressable>
+          );
+        })}
+      </View>
+
+      {selectedProvider === "ecoleDirecte" && (
+        <>
+          <Text style={styles.inputLabel}>Identifiant École Directe</Text>
+          <TextInput
+            value={username}
+            onChangeText={setUsername}
+            autoCapitalize="none"
+            autoCorrect={false}
+            textContentType="username"
+            placeholder="Identifiant École Directe"
+            placeholderTextColor="#87938E"
+            style={styles.input}
+          />
+          <Text style={styles.inputLabel}>Mot de passe</Text>
+          <TextInput
+            value={password}
+            onChangeText={setPassword}
+            secureTextEntry
+            textContentType="password"
+            placeholder="Mot de passe"
+            placeholderTextColor="#87938E"
+            style={styles.input}
+          />
+          <AppButton
+            label={busy ? "Connexion…" : "Connecter École Directe"}
+            onPress={() => void connect()}
+            icon={busy ? <ActivityIndicator color="#FFFFFF" /> : <ArrowRight size={17} color="#FFFFFF" />}
+            disabled={busy}
+          />
+        </>
+      )}
+
+      {selectedProvider === "pronote" && (
+        <>
+          <AppButton
+            label="Se connecter à Pronote via l’ENT"
+            onPress={() => void connectPronoteAccount()}
+            icon={<ArrowRight size={17} color="#FFFFFF" />}
+            disabled={busy}
+          />
+        </>
+      )}
+
+      {selectedProvider === "skolengo" && (
+        <>
+          <Text style={styles.inputLabel}>Établissement</Text>
+          <View style={styles.schoolSearchRow}>
+            <TextInput
+              value={schoolSearch}
+              onChangeText={setSchoolSearch}
+              placeholder="Nom de l’établissement"
+              placeholderTextColor="#87938E"
+              style={[styles.input, styles.schoolSearchInput]}
+              onSubmitEditing={() => void findSkolengoSchools()}
+              returnKeyType="search"
+            />
+            <Pressable
+              accessibilityRole="button"
+              accessibilityLabel="Rechercher un établissement Skolengo"
+              onPress={() => void findSkolengoSchools()}
+              disabled={busy}
+              style={styles.schoolSearchButton}
+            >
+              {busy ? <ActivityIndicator color={palette.green} /> : <RefreshCw size={17} color={palette.green} />}
+            </Pressable>
+          </View>
+          {skolengoSchools.map((school) => (
+            <Pressable
+              key={school.id}
+              accessibilityRole="button"
+              onPress={() => void connectSkolengoAccount(school)}
+              disabled={busy}
+              style={styles.schoolResult}
+            >
+              <View style={styles.rowContent}>
+                <Text style={styles.rowTitle}>{school.name}</Text>
+                <Text style={styles.rowDetail}>{school.location.city}</Text>
+              </View>
+              <ArrowRight size={16} color={palette.green} />
+            </Pressable>
+          ))}
+        </>
+      )}
+
+      <View style={styles.rememberRow}>
+        <Switch
+          value={rememberCredentials}
+          onValueChange={(enabled) => {
+            setRememberCredentials(enabled);
+            if (!enabled) {
+              const metadataOnly = providerAccounts.map((account) => ({ ...account, refreshToken: undefined }));
+              providerAccountsRef.current = metadataOnly;
+              setProviderAccounts(metadataOnly);
+              void persistProviderAccounts(metadataOnly, false);
+              void SecureStore.deleteItemAsync(CREDENTIALS_KEY);
+              void SecureStore.deleteItemAsync(DEVICE_KEY);
+              void disableBackgroundSync();
+              setBackgroundSyncEnabled(false);
+            }
+          }}
+          trackColor={{ false: "#D4DBD7", true: "#76CBB0" }}
+          thumbColor={rememberCredentials ? palette.green : "#FFFFFF"}
+        />
+        <Text style={styles.rememberText}>Mémoriser les connexions sur cet appareil</Text>
+      </View>
+
+      {childrenProfiles.length > 0 && (
+        <View style={styles.parentChildrenSection}>
+          <Text style={styles.inputLabel}>Enfants trouvés</Text>
+          {childrenProfiles.map((child) => (
+            <View key={child.id} style={styles.parentChildRow}>
+              <PupilHeading pupil={{ id: childrenProfiles.indexOf(child) + 1, prenom: child.firstName, nom: child.lastName }} detail={child.className} />
+              <ProviderSourceSelector
+                child={child}
+                accounts={providerAccounts.filter((account) => providerSessionsRef.current.has(account.id))}
+                onChange={(domain, provider) => void changeDomainSource(child.id, domain, provider)}
+              />
+            </View>
+          ))}
+        </View>
+      )}
+
+      <Modal
+        visible={pronoteLoginOpen}
+        animationType="slide"
+        onRequestClose={() => setPronoteLoginOpen(false)}
+      >
+        <SafeAreaView style={styles.pronoteLoginScreen} edges={["top", "bottom"]}>
+          <View style={styles.pronoteLoginHeader}>
+            <View style={styles.rowContent}>
+              <Text style={styles.rowTitle}>Connexion Pronote</Text>
+              <Text style={styles.rowDetail}>Tu te connectes sur la page de ton ENT (EduConnect, FranceConnect…).</Text>
+            </View>
+            <Pressable
+              accessibilityRole="button"
+              accessibilityLabel="Annuler la connexion Pronote"
+              onPress={() => setPronoteLoginOpen(false)}
+              style={styles.closeButton}
+            >
+              <X size={20} color={palette.ink} />
+            </Pressable>
+          </View>
+          <View style={styles.pronotePinPanel}>
+            <Text style={styles.inputLabel}>Adresse Pronote de l’établissement</Text>
+            <TextInput
+              value={pronoteStartUrl}
+              onChangeText={setPronoteStartUrl}
+              placeholder="https://0000000X.index-education.net/pronote"
+              placeholderTextColor="#87938E"
+              autoCapitalize="none"
+              autoCorrect={false}
+              keyboardType="url"
+              style={styles.input}
+            />
+            {!!pronoteLoginError && <Text accessibilityRole="alert" style={styles.pronoteLoginError}>{pronoteLoginError}</Text>}
+            <AppButton
+              label={busy ? "Connexion…" : "Ouvrir la connexion ENT"}
+              onPress={startPronoteSso}
+              icon={busy ? <ActivityIndicator color="#FFFFFF" /> : <ArrowRight size={17} color="#FFFFFF" />}
+              disabled={busy || !pronoteStartUrl.trim()}
+            />
+          </View>
+        </SafeAreaView>
+        <PronoteSsoModal
+          visible={pronoteSsoOpen}
+          baseUrl={pronoteStartUrl}
+          onCancel={() => setPronoteSsoOpen(false)}
+          onCaptured={(capture) => void finishPronoteLogin(capture)}
+          onError={(message) => {
+            setPronoteSsoOpen(false);
+            setPronoteLoginError(message);
+          }}
+        />
+      </Modal>
+    </View>
+  );
 
   const renderJournal = () => (
     <>
+      {childrenProfiles.length > 0 && (
+        <ChildProfilesBar
+          children={childrenProfiles}
+          activeChildId={activeChildId}
+          onSelectChild={selectActiveChild}
+          onAddChild={() => {
+            setTab("compte");
+          }}
+        />
+      )}
       <View style={styles.hero}>
         <View style={styles.heroTopline}>
           <Text style={styles.heroEyebrow}>TON JOUR EN UN COUP D'OEIL</Text>
@@ -800,7 +1781,8 @@ function AppContent() {
       </View>
       <View style={styles.listSection}>
         {!data && <EmptyLine>Connecte ton compte pour afficher les cours de la journée.</EmptyLine>}
-        {data?.map((studentData) => (
+        {data && visibleData?.length === 0 && <EmptyLine>Aucune donnée ne correspond à ce profil enfant.</EmptyLine>}
+        {visibleData?.map((studentData) => (
           <View key={studentData.student.id} style={styles.pupilGroup}>
             <PupilHeading pupil={studentData.student} detail={`${studentData.courses.length} cours`} />
             {studentData.error ? <EmptyLine>{studentData.error}</EmptyLine> : studentData.courses.length === 0 ? <EmptyLine>Aucun cours prévu ce jour-là.</EmptyLine> :
@@ -826,7 +1808,7 @@ function AppContent() {
       </View>
       <View style={styles.listSection}>
         {!data && <EmptyLine>Les devoirs à venir apparaîtront ici après connexion.</EmptyLine>}
-        {data?.map((studentData) => (
+        {visibleData?.map((studentData) => (
           <View key={studentData.student.id} style={styles.pupilGroup}>
             <PupilHeading pupil={studentData.student} detail={`${studentData.homeworks.length} devoir${studentData.homeworks.length === 1 ? "" : "s"}`} />
             {studentData.error ? <EmptyLine>{studentData.error}</EmptyLine> : studentData.homeworks.length === 0 ? <EmptyLine>Aucun devoir sur cette période.</EmptyLine> :
@@ -862,11 +1844,12 @@ function AppContent() {
       </View>
       <View style={styles.listSection}>
         {!data && <EmptyLine>Connecte ton compte pour retrouver tes notes.</EmptyLine>}
-        {data?.map((studentData) => (
+        {visibleData?.map((studentData) => (
           <View key={studentData.student.id} style={styles.pupilGroup}>
             <PupilHeading pupil={studentData.student} />
             {studentData.error ? <EmptyLine>{studentData.error}</EmptyLine> : (
               <>
+                {studentData.gradesError && <EmptyLine>{studentData.gradesError}</EmptyLine>}
                 <Text style={styles.groupCaption}>Matières et dernières notes</Text>
                 {studentData.grades.length === 0 ? <EmptyLine>Aucune note récente.</EmptyLine> :
                   studentData.grades.map((grade, index) => (
@@ -976,41 +1959,10 @@ function AppContent() {
   const renderAccount = () => (
     <>
       <View style={styles.pageIntro}>
-        <Text style={styles.pageTitle}>Ton compte</Text>
-        <Text style={styles.pageDescription}>Connexion directe à École Directe, sans serveur intermédiaire.</Text>
+        <Text style={styles.pageTitle}>Comptes parents</Text>
+        <Text style={styles.pageDescription}>Relie les services scolaires utilisés par ta famille.</Text>
       </View>
-      {sessionRef.current ? (
-        <>
-        <View style={styles.accountPanel}>
-          <View style={styles.accountBadge}><UserRound size={22} color={palette.green} /></View>
-          <Text style={styles.accountName}>{accountName || "Compte connecté"}</Text>
-          <Text style={styles.accountStatus}>Synchronisé à {data?.[0] ? new Date(data[0].syncedAt).toLocaleTimeString("fr-FR", { hour: "2-digit", minute: "2-digit" }) : "l'instant"}</Text>
-          <View style={styles.accountActions}>
-            <AppButton
-              label="Actualiser"
-              onPress={() => void refresh()}
-              icon={busy ? <ActivityIndicator color="#FFFFFF" /> : <RefreshCw size={17} color="#FFFFFF" />}
-              disabled={busy}
-            />
-            <Pressable accessibilityRole="button" accessibilityLabel="Déconnecter" onPress={signOut} style={styles.logoutButton}>
-              <LogOut size={18} color={palette.coral} />
-            </Pressable>
-          </View>
-        </View>
-        {sessionRef.current.pupils?.map((pupil) => {
-          const studentData = data?.find((entry) => entry.student.id === pupil.id);
-          const className = pupil.classe?.libelle || pupil.classe?.code;
-          return (
-            <View key={pupil.id} style={styles.pupilProfile}>
-              <PupilHeading pupil={pupil} detail={className || "Élève du profil"} />
-              <Text style={styles.pupilProfileStatus}>
-                {studentData?.error || (studentData
-                  ? `${studentData.courses.length} cours · ${studentData.homeworks.length} devoirs synchronisés`
-                  : "En attente de synchronisation")}
-              </Text>
-            </View>
-          );
-        })}
+      {sessionRef.current && (
         <View style={styles.settingsMenu}>
           <Pressable
             accessibilityRole="button"
@@ -1076,8 +2028,8 @@ function AppContent() {
             </View>
           )}
         </View>
-        </>
-      ) : challenge ? (
+      )}
+      {challenge && (
         <View style={styles.loginPanel}>
           <Text style={styles.formTitle}>Vérification requise</Text>
           <Text style={styles.formDescription}>{challenge.question}</Text>
@@ -1091,52 +2043,12 @@ function AppContent() {
           </View>
           <Pressable onPress={() => setChallenge(null)}><Text style={styles.cancelText}>Annuler</Text></Pressable>
         </View>
-      ) : (
-        <View style={styles.loginPanel}>
-          <Text style={styles.formTitle}>Se connecter</Text>
-          <Text style={styles.formDescription}>Utilise les identifiants de ton espace École Directe.</Text>
-          <Text style={styles.inputLabel}>Identifiant</Text>
-          <TextInput
-            value={username}
-            onChangeText={setUsername}
-            autoCapitalize="none"
-            autoCorrect={false}
-            textContentType="username"
-            placeholder="Identifiant École Directe"
-            placeholderTextColor="#87938E"
-            style={styles.input}
-          />
-          <Text style={styles.inputLabel}>Mot de passe</Text>
-          <TextInput
-            value={password}
-            onChangeText={setPassword}
-            secureTextEntry
-            textContentType="password"
-            placeholder="Mot de passe"
-            placeholderTextColor="#87938E"
-            style={styles.input}
-          />
-          <View style={styles.rememberRow}>
-            <Switch
-              value={rememberCredentials}
-              onValueChange={setRememberCredentials}
-              trackColor={{ false: "#D4DBD7", true: "#76CBB0" }}
-              thumbColor={rememberCredentials ? palette.green : "#FFFFFF"}
-            />
-            <Text style={styles.rememberText}>Garder les identifiants sur cet appareil</Text>
-          </View>
-          <AppButton
-            label={busy ? "Connexion…" : "Se connecter"}
-            onPress={() => void connect()}
-            icon={busy ? <ActivityIndicator color="#FFFFFF" /> : <ArrowRight size={17} color="#FFFFFF" />}
-            disabled={busy}
-          />
-        </View>
       )}
+      {renderProviderManager()}
       <View style={styles.privacyNote}>
         <Text style={styles.privacyTitle}>Tes données restent sur ton téléphone</Text>
         <Text style={styles.privacyCopy}>
-          La connexion suit la documentation publique de l'API non officielle d'École Directe. Les identifiants facultativement mémorisés sont conservés dans le stockage sécurisé du téléphone.
+          Les connexions utilisent les API non officielles des services scolaires. Identifiants et jetons restent sur ce téléphone; leur mémorisation est facultative et protégée.
         </Text>
       </View>
     </>
@@ -1153,7 +2065,7 @@ function AppContent() {
         <View style={styles.brandMark}><CalendarDays size={19} color="#FFFFFF" /></View>
         <View style={styles.brandTextWrap}>
           <Text style={styles.brand}>tempo</Text>
-          <Text style={styles.brandCaption}>ÉCOLE DIRECTE, EN CLAIR</Text>
+          <Text style={styles.brandCaption}>SERVICES SCOLAIRES, EN CLAIR</Text>
         </View>
         <View style={[styles.connectionDot, data ? styles.connectionOnline : styles.connectionOffline]} />
         <Text style={styles.connectionLabel}>{data ? "Connecté" : "Hors ligne"}</Text>
@@ -1350,10 +2262,6 @@ const styles = StyleSheet.create({
   buttonPressed: { opacity: 0.82 },
   buttonText: { color: "#FFFFFF", fontSize: 13, fontWeight: "700" },
   buttonTextSecondary: { color: palette.green },
-  accountPanel: { alignItems: "center", padding: 20, borderRadius: 16, borderWidth: 1, borderColor: palette.line, backgroundColor: "#FFFFFF" },
-  accountBadge: { width: 50, height: 50, alignItems: "center", justifyContent: "center", borderRadius: 16, backgroundColor: "#E2F1EA" },
-  accountName: { color: palette.ink, fontSize: 17, fontWeight: "700", marginTop: 13 },
-  accountStatus: { color: palette.muted, fontSize: 11, marginTop: 5 },
   settingsMenu: { marginTop: 12, borderWidth: 1, borderColor: palette.line, backgroundColor: "#FFFFFF" },
   settingsMenuHeader: { minHeight: 48, flexDirection: "row", alignItems: "center", gap: 10, paddingHorizontal: 14 },
   settingsMenuTitle: { flex: 1, color: palette.ink, fontSize: 13, fontWeight: "700" },
@@ -1365,21 +2273,60 @@ const styles = StyleSheet.create({
   settingsCheckText: { color: palette.green, fontSize: 11, fontWeight: "700" },
   settingsStatus: { gap: 5, paddingTop: 11 },
   settingsStatusText: { color: palette.muted, fontSize: 10, lineHeight: 15 },
-  pupilProfile: { padding: 12, marginTop: 10, borderWidth: 1, borderColor: palette.line, backgroundColor: "#FFFFFF" },
-  pupilProfileStatus: { color: palette.muted, fontSize: 11, lineHeight: 16, marginTop: 8, marginLeft: 61 },
   pupilGroup: { paddingTop: 10, paddingBottom: 5, borderBottomWidth: 1, borderBottomColor: palette.line },
   pupilHeading: { minHeight: 46, flexDirection: "row", alignItems: "center", gap: 11, paddingHorizontal: 12, paddingVertical: 5 },
   pupilPhoto: { width: 38, height: 38, borderRadius: 19, backgroundColor: "#E2F1EA" },
   pupilPhotoFallback: { alignItems: "center", justifyContent: "center" },
-  accountActions: { flexDirection: "row", alignItems: "center", gap: 10, marginTop: 19, width: "100%" },
   modalBackdrop: { flex: 1, justifyContent: "center", padding: 16, backgroundColor: "rgba(15, 29, 25, 0.58)" },
   homeworkModal: { height: "90%", overflow: "hidden", borderRadius: 14, backgroundColor: "#FFFFFF" },
   homeworkModalHeader: { minHeight: 72, flexDirection: "row", alignItems: "center", gap: 12, paddingHorizontal: 16, borderBottomWidth: 1, borderBottomColor: palette.line },
   homeworkModalTitle: { color: palette.ink, fontSize: 16, fontWeight: "700" },
   closeButton: { width: 38, height: 38, alignItems: "center", justifyContent: "center", backgroundColor: palette.background },
   homeworkWebView: { flex: 1, backgroundColor: "#FFFFFF" },
-  logoutButton: { width: 46, height: 46, alignItems: "center", justifyContent: "center", borderRadius: 11, backgroundColor: "#F8E8E0" },
   loginPanel: { padding: 17, borderRadius: 16, borderWidth: 1, borderColor: palette.line, backgroundColor: "#FFFFFF" },
+  childBarContainer: { marginTop: 8, marginBottom: 12 },
+  childBarScroll: { flexDirection: "row", gap: 8, paddingHorizontal: 2 },
+  childChip: { flexDirection: "row", alignItems: "center", gap: 6, paddingVertical: 8, paddingHorizontal: 12, borderRadius: 20, borderWidth: 1, borderColor: palette.line, backgroundColor: "#FFFFFF" },
+  childChipActive: { backgroundColor: palette.green, borderColor: palette.green },
+  childChipText: { fontSize: 12, fontWeight: "700", color: palette.ink },
+  childChipTextActive: { color: "#FFFFFF" },
+  childChipAdd: { flexDirection: "row", alignItems: "center", gap: 4, paddingVertical: 8, paddingHorizontal: 12, borderRadius: 20, borderWidth: 1, borderColor: palette.line, backgroundColor: "#E7F2ED" },
+  childChipAddText: { fontSize: 12, fontWeight: "700", color: palette.green },
+  childSourcesCard: { gap: 12, padding: 12, marginTop: 10, borderRadius: 10, backgroundColor: palette.background },
+  childSourceRow: { gap: 7 },
+  childSourceLabel: { color: palette.ink, fontSize: 11, fontWeight: "700" },
+  domainChoiceRow: { flexDirection: "row", flexWrap: "wrap", gap: 6 },
+  domainChoice: { minHeight: 34, justifyContent: "center", paddingHorizontal: 10, borderRadius: 8, borderWidth: 1, borderColor: palette.line, backgroundColor: palette.surface },
+  domainChoiceSelected: { borderColor: palette.green, backgroundColor: "#E2F1EA" },
+  domainChoiceText: { color: palette.muted, fontSize: 10, fontWeight: "600" },
+  domainChoiceTextSelected: { color: palette.green, fontWeight: "800" },
+  parentSpace: { marginTop: 20, padding: 15, borderRadius: 14, borderWidth: 1, borderColor: palette.line, backgroundColor: palette.surface },
+  classAverageText: { color: palette.muted, fontSize: 10, fontWeight: "600", marginTop: 2 },
+  initialsText: { color: palette.green, fontSize: 15, fontWeight: "800" },
+  subTabBar: { flexDirection: "row", gap: 6, marginBottom: 16, backgroundColor: "#E7F2ED", padding: 4, borderRadius: 12 },
+  subTabButton: { flex: 1, flexDirection: "row", alignItems: "center", justifyContent: "center", gap: 6, paddingVertical: 10, borderRadius: 9 },
+  subTabButtonActive: { backgroundColor: palette.green },
+  subTabText: { fontSize: 11, fontWeight: "700", color: palette.green },
+  subTabTextActive: { color: "#FFFFFF" },
+  maintenanceCard: { padding: 16, borderRadius: 14, borderWidth: 1, borderColor: palette.line, backgroundColor: "#FFFFFF", marginBottom: 14 },
+  parentSpaceHeading: { gap: 3, marginBottom: 13 },
+  pronoteLoginScreen: { flex: 1, backgroundColor: palette.background },
+  pronoteLoginHeader: { minHeight: 68, flexDirection: "row", alignItems: "center", gap: 12, paddingHorizontal: 16, borderBottomWidth: 1, borderBottomColor: palette.line },
+  pronotePinPanel: { flex: 1, justifyContent: "center", gap: 10, padding: 20, backgroundColor: palette.surface },
+  pronoteLoginError: { color: palette.coral, fontSize: 12, lineHeight: 17, marginBottom: 10 },
+  providerAccountRow: { minHeight: 60, flexDirection: "row", alignItems: "center", gap: 10, paddingVertical: 8, borderBottomWidth: 1, borderBottomColor: palette.line },
+  providerDisconnectButton: { width: 38, height: 38, alignItems: "center", justifyContent: "center", borderRadius: 9, backgroundColor: "#F8E8E0" },
+  serviceProviderRow: { flexDirection: "row", gap: 6, marginBottom: 14 },
+  serviceProviderButton: { flex: 1, minHeight: 40, alignItems: "center", justifyContent: "center", paddingHorizontal: 5, borderRadius: 8, borderWidth: 1, borderColor: palette.line, backgroundColor: palette.background },
+  serviceProviderButtonSelected: { borderColor: palette.green, backgroundColor: palette.green },
+  serviceProviderText: { color: palette.muted, fontSize: 10, fontWeight: "700", textAlign: "center" },
+  serviceProviderTextSelected: { color: "#FFFFFF" },
+  schoolSearchRow: { flexDirection: "row", alignItems: "flex-start", gap: 8 },
+  schoolSearchInput: { flex: 1 },
+  schoolSearchButton: { width: 43, height: 43, alignItems: "center", justifyContent: "center", borderRadius: 9, borderWidth: 1, borderColor: palette.line, backgroundColor: palette.background },
+  schoolResult: { minHeight: 52, flexDirection: "row", alignItems: "center", gap: 10, paddingHorizontal: 10, borderBottomWidth: 1, borderBottomColor: palette.line },
+  parentChildrenSection: { marginTop: 18 },
+  parentChildRow: { paddingVertical: 10, borderTopWidth: 1, borderTopColor: palette.line },
   formTitle: { color: palette.ink, fontSize: 17, fontWeight: "700" },
   formDescription: { color: palette.muted, fontSize: 12, lineHeight: 18, marginTop: 5, marginBottom: 17 },
   inputLabel: { color: palette.ink, fontSize: 11, fontWeight: "700", marginBottom: 6 },

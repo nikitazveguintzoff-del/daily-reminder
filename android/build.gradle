@@ -1,12 +1,5 @@
 // Top-level build file where you can add configuration options common to all sub-projects/modules.
 
-try {
-  def env = System.getenv()
-  def field = env.getClass().getDeclaredField("m")
-  field.setAccessible(true)
-  field.get(env).remove("ANDROID_PREFS_ROOT")
-} catch (ignored) {}
-
 buildscript {
   repositories {
     google()

@@ -8,13 +8,15 @@ export type ReminderPreferences = {
   homework: { enabled: boolean; time: string };
   grades: { enabled: boolean; time: string };
   homeworkDays: number;
+  freeze?: { enabled: boolean; startDate: string; endDate: string };
 };
 
 export const defaultPreferences: ReminderPreferences = {
   classes: { enabled: true, time: "07:00" },
   homework: { enabled: true, time: "17:00" },
   grades: { enabled: true, time: "18:00" },
-  homeworkDays: 3
+  homeworkDays: 3,
+  freeze: { enabled: false, startDate: "", endDate: "" }
 };
 
 export function normalizeTime(time: string): string {
@@ -28,10 +30,56 @@ export function normalizeTime(time: string): string {
 }
 
 export async function scheduleDailyReminders(
-  _preferences: ReminderPreferences,
-  _data: SchoolData[] | null
+  preferences: ReminderPreferences,
+  data: SchoolData[] | null
 ): Promise<boolean> {
-  return true;
+  try {
+    let permission = await Notifications.getPermissionsAsync();
+    if (!permission.granted) {
+      permission = await Notifications.requestPermissionsAsync();
+    }
+    if (!permission.granted) return false;
+
+    if (Platform.OS === "android") {
+      await Notifications.setNotificationChannelAsync("tempo-reminders", {
+        name: "Rappels Tempo",
+        importance: Notifications.AndroidImportance.HIGH,
+        vibrationPattern: [0, 250, 250, 250],
+        lightColor: "#16866A",
+        enableVibrate: true,
+        showBadge: true
+      });
+    }
+
+    await Notifications.cancelAllScheduledNotificationsAsync();
+
+    const candidates = createReminderNotifications(preferences, data, new Date());
+
+    for (const reminder of candidates) {
+      const normalized = normalizeTime(reminder.time);
+      const [hour, minute] = normalized.split(":").map(Number);
+      if (!Number.isInteger(hour) || !Number.isInteger(minute)) continue;
+
+      await Notifications.scheduleNotificationAsync({
+        content: {
+          title: reminder.title,
+          body: reminder.body,
+          sound: true,
+          data: { screen: reminder.key }
+        },
+        trigger: {
+          type: Notifications.SchedulableTriggerInputTypes.DAILY,
+          hour,
+          minute
+        }
+      });
+    }
+
+    return true;
+  } catch (error) {
+    console.error("[REMINDERS] Failed to schedule daily reminders:", error);
+    return false;
+  }
 }
 
 function localDayKey(date: Date): string {
@@ -57,6 +105,70 @@ function formatCourseTime(value: string): string {
   return match ? `${Number(match[1])}h${match[2]}` : "--:--";
 }
 
+function getStudentName(studentData: SchoolData): string {
+  const pupil = studentData.student;
+  return pupil.prenom || (pupil.nom ? pupil.nom.split(" ")[0] : `Élève ${pupil.id}`);
+}
+
+function buildClassesBody(data: SchoolData[] | null): string {
+  if (!data || data.length === 0) return "Ton rappel de cours fonctionne.";
+
+  const lines = data.map((studentData) => {
+    const name = getStudentName(studentData);
+    const courses = [...studentData.courses].sort((a, b) => a.start.localeCompare(b.start));
+    if (courses.length === 0) {
+      return `${name} : Aucun cours prévu`;
+    }
+    const firstCourse = courses[0];
+    const lastCourse = [...courses].sort((a, b) => a.end.localeCompare(b.end)).at(-1) || firstCourse;
+    const extra = courses.length > 1 ? ` (+${courses.length - 1})` : "";
+    return `${name} : ${formatCourseTime(firstCourse.start)}-${formatCourseTime(lastCourse.end)} · ${firstCourse.subject}${extra}`;
+  });
+
+  return lines.join("\n");
+}
+
+function buildHomeworksBody(data: SchoolData[] | null, tomorrowKey: string): string {
+  if (!data || data.length === 0) return "Ton rappel de devoirs fonctionne.";
+
+  const lines = data.map((studentData) => {
+    const name = getStudentName(studentData);
+    const homeworks = studentData.homeworks;
+    const doneCount = homeworks.filter((h) => h.done).length;
+    const todoCount = homeworks.filter((h) => !h.done).length;
+    const tomorrowCount = homeworks.filter((h) => !h.done && h.dueDate.slice(0, 10) === tomorrowKey).length;
+    return `${name} : ${doneCount} fait${doneCount > 1 ? "s" : ""} · ${todoCount} à faire · ${tomorrowCount} pour demain`;
+  });
+
+  return lines.join("\n");
+}
+
+function buildGradesBody(data: SchoolData[] | null, dayKey: string): string {
+  if (!data || data.length === 0) return "Ton rappel de notes fonctionne.";
+
+  const lines = data.map((studentData) => {
+    const name = getStudentName(studentData);
+    const todaysGrades = studentData.grades.filter((g) => {
+      const ts = dateTimestamp(g.date);
+      return Number.isFinite(ts) && localDayKey(new Date(ts)) === dayKey;
+    });
+
+    if (todaysGrades.length > 0) {
+      const topGrade = todaysGrades[0];
+      const extra = todaysGrades.length > 1 ? ` (+${todaysGrades.length - 1})` : "";
+      return `${name} : ${todaysGrades.length} nouvelle${todaysGrades.length > 1 ? "s" : ""} note${todaysGrades.length > 1 ? "s" : ""} (${topGrade.subject} : ${topGrade.value})${extra}`;
+    }
+
+    const latest = [...studentData.grades].sort((a, b) => dateTimestamp(b.date) - dateTimestamp(a.date))[0];
+    if (latest) {
+      return `${name} : Pas de nouvelle note (${latest.subject} : ${latest.value})`;
+    }
+    return `${name} : Aucune note récente`;
+  });
+
+  return lines.join("\n");
+}
+
 function createReminderNotifications(
   preferences: ReminderPreferences,
   data: SchoolData[] | null,
@@ -66,44 +178,32 @@ function createReminderNotifications(
   const tomorrow = new Date(now);
   tomorrow.setDate(tomorrow.getDate() + 1);
   const tomorrowKey = localDayKey(tomorrow);
-  const courses = (data || []).flatMap((student) => student.courses)
-    .sort((first, second) => first.start.localeCompare(second.start));
-  const lastCourse = [...courses].sort((first, second) => first.end.localeCompare(second.end)).at(-1);
-  const homeworks = (data || []).flatMap((student) => student.homeworks);
-  const grades = (data || []).flatMap((student) => student.grades);
-  const latestGrade = [...grades].sort((first, second) => dateTimestamp(second.date) - dateTimestamp(first.date))[0];
-  const todaysGrades = grades.filter((grade) => {
-    const timestamp = dateTimestamp(grade.date);
-    return Number.isFinite(timestamp) && localDayKey(new Date(timestamp)) === dayKey;
-  });
-  const nextDayHomeworkCount = homeworks.filter((homework) => homework.dueDate.slice(0, 10) === tomorrowKey && !homework.done).length;
+
+  if (preferences.freeze?.enabled && preferences.freeze.startDate && preferences.freeze.endDate) {
+    if (dayKey >= preferences.freeze.startDate && dayKey <= preferences.freeze.endDate) {
+      console.log("[REMINDERS] Notifications gelées jusqu'au", preferences.freeze.endDate);
+      return [];
+    }
+  }
 
   return [
     preferences.classes.enabled && {
       key: "classes",
       time: preferences.classes.time,
-      title: "Tempo · Cours",
-      body: !data
-        ? "Ton rappel de cours fonctionne."
-        : courses.length > 0
-        ? `${formatCourseTime(courses[0].start)}-${formatCourseTime(lastCourse?.end || courses[0].end)} * ${courses[0].subject}${courses.length > 1 ? ` + ${courses.length - 1} cours` : ""}`
-        : "Aucun cours prévu pour cette journée."
+      title: "Tempo · Cours du jour",
+      body: buildClassesBody(data)
     },
     preferences.homework.enabled && {
       key: "homework",
       time: preferences.homework.time,
-      title: "Tempo · Devoirs",
-      body: data
-        ? `${homeworks.filter((homework) => homework.done).length} faits · ${homeworks.filter((homework) => !homework.done).length} non faits · ${nextDayHomeworkCount} à faire demain`
-        : "Ton rappel de devoirs fonctionne."
+      title: "Tempo · Devoirs à venir",
+      body: buildHomeworksBody(data, tomorrowKey)
     },
-    preferences.grades.enabled && (!data || todaysGrades.length > 0) && {
+    preferences.grades.enabled && {
       key: "grades",
       time: preferences.grades.time,
-      title: "Tempo · Notes",
-      body: data
-        ? `${todaysGrades.length} nouvelle${todaysGrades.length === 1 ? "" : "s"} note${todaysGrades.length === 1 ? "" : "s"} aujourd’hui${latestGrade ? ` · ${latestGrade.subject} : ${latestGrade.value}` : ""}`
-        : "Ton rappel de notes fonctionne."
+      title: "Tempo · Dernières notes",
+      body: buildGradesBody(data, dayKey)
     }
   ].filter((candidate): candidate is { key: string; time: string; title: string; body: string } => Boolean(candidate));
 }

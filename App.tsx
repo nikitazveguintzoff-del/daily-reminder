@@ -43,7 +43,17 @@ import {
 } from "lucide-react-native";
 import { WebView } from "react-native-webview";
 import { PronoteSsoModal } from "./src/PronoteSsoModal";
+import { PhotoWebViewHost } from "./src/PhotoWebViewHost";
+import { getCachedPhoto, inlinePhoto } from "./src/photos";
+import { USER_AGENT as ED_PHOTO_USER_AGENT } from "./src/ecoleDirecte";
 import { pronoteBaseUrl, type PronoteSsoCapture } from "./src/providers/pronoteSso";
+import {
+  getCurrentOrNextHoliday,
+  getSavedZone,
+  saveZone,
+  SCHOOL_HOLIDAYS,
+  type SchoolZone
+} from "./src/holidays";
 import {
   BACKGROUND_SYNC_ENABLED_KEY,
   CREDENTIALS_KEY,
@@ -168,6 +178,78 @@ function dateTimestamp(value: string): number {
   return new Date(`${datePart}T12:00:00`).getTime();
 }
 
+function normalizePhotoUri(photo?: string): string | undefined {
+  const value = photo?.trim();
+  if (!value) return undefined;
+  if (/^data:image\//i.test(value) || /^https?:\/\//i.test(value)) return value;
+  if (value.startsWith("//")) return `https:${value}`;
+  if (value.startsWith("/")) return `https://www.ecoledirecte.com${value}`;
+  if (/^[A-Za-z0-9+/=_-]+$/.test(value)) return `data:image/jpeg;base64,${value}`;
+  return undefined;
+}
+
+function photoUriDiagnostic(photo?: string): {
+  present: boolean;
+  length: number;
+  kind: string;
+  protocol?: string;
+  host?: string;
+} {
+  const uri = photo?.trim() || "";
+  let protocol: string | undefined;
+  let host: string | undefined;
+  try {
+    const parsed = new URL(uri);
+    protocol = parsed.protocol;
+    host = parsed.host;
+  } catch {
+    // Not all photo values are URLs; the kind below identifies other formats.
+  }
+  return {
+    present: !!uri,
+    length: uri.length,
+    ...(protocol ? { protocol, host } : {}),
+    kind: /^data:image\//i.test(uri)
+      ? "data-uri"
+      : /^https?:\/\//i.test(uri)
+        ? "absolute-url"
+        : uri.startsWith("//")
+          ? "protocol-relative-url"
+          : uri.startsWith("/")
+            ? "relative-path"
+            : /^[A-Za-z0-9+/=_-]+$/.test(uri)
+              ? "base64-like"
+              : uri ? "other" : "missing"
+  };
+}
+
+function sanitizePhotoError(message: string): string {
+  return message.replace(/https?:\/\/[^\s"'<>]+/gi, (value) => {
+    try {
+      return `${new URL(value).origin}/[redacted]`;
+    } catch {
+      return "[redacted URL]";
+    }
+  });
+}
+
+function childProfilePhoto(child: ChildProfile, accounts: ProviderAccount[]): string | undefined {
+  const providers = [...new Set([
+    child.sources.photo,
+    ...Object.keys(child.links) as ProviderType[]
+  ].filter((provider): provider is ProviderType => provider !== null))];
+  for (const provider of providers) {
+    const link = child.links[provider];
+    if (!link) continue;
+    const photo = accounts
+      .find((account) => account.id === link.accountId)
+      ?.students.find((student) => student.id === link.studentId)?.photo;
+    const photoUri = normalizePhotoUri(photo);
+    if (photoUri) return getCachedPhoto(photoUri) ?? photoUri;
+  }
+  return undefined;
+}
+
 function logLoginFailure(message: string, error: unknown, ...details: unknown[]): void {
   const errorCode = (error as { code?: number })?.code;
   const log = errorCode === 250 ? console.log : console.error;
@@ -217,20 +299,19 @@ function EmptyLine({ children }: { children: string }) {
   return <Text style={styles.emptyLine}>{children}</Text>;
 }
 
-function PupilHeading({ pupil, detail }: { pupil: EdPupil; detail?: string }) {
+function PupilHeading({
+  pupil,
+  detail,
+  context = "journal"
+}: {
+  pupil: EdPupil;
+  detail?: string;
+  context?: "journal" | "compte";
+}) {
   const [photoFailed, setPhotoFailed] = useState(false);
   const name = [pupil.prenom, pupil.nom].filter(Boolean).join(" ") || `Élève ${pupil.id}`;
-
-  let photoUri: string | undefined = undefined;
-  if (pupil.photo) {
-    if (pupil.photo.startsWith("data:image") || pupil.photo.startsWith("http")) {
-      photoUri = pupil.photo;
-    } else if (pupil.photo.startsWith("//")) {
-      photoUri = `https:${pupil.photo}`;
-    } else if (/^[A-Za-z0-9+/=]+$/.test(pupil.photo.slice(0, 100))) {
-      photoUri = `data:image/jpeg;base64,${pupil.photo}`;
-    }
-  }
+  const photoUri = normalizePhotoUri(pupil.photo);
+  useEffect(() => setPhotoFailed(false), [photoUri]);
 
   const initials = (pupil.prenom?.[0] || pupil.nom?.[0] || "E").toUpperCase();
 
@@ -240,7 +321,15 @@ function PupilHeading({ pupil, detail }: { pupil: EdPupil; detail?: string }) {
         <Image
           source={{ uri: photoUri }}
           resizeMode="cover"
-          onError={() => setPhotoFailed(true)}
+          onLoad={() => console.info("[PHOTO-RENDER] Image chargée.", { context, ...photoUriDiagnostic(photoUri) })}
+          onError={(event) => {
+            console.warn("[PHOTO-RENDER] Échec du chargement de l’image.", {
+              context,
+              ...photoUriDiagnostic(photoUri),
+              error: sanitizePhotoError(event.nativeEvent.error)
+            });
+            setPhotoFailed(true);
+          }}
           style={styles.pupilPhoto}
         />
       ) : (
@@ -253,6 +342,43 @@ function PupilHeading({ pupil, detail }: { pupil: EdPupil; detail?: string }) {
         {!!detail && <Text style={styles.rowDetail}>{detail}</Text>}
       </View>
     </View>
+  );
+}
+
+function ChildProfileAvatar({
+  photo,
+  active,
+  name
+}: {
+  photo?: string;
+  active: boolean;
+  name: string;
+}) {
+  const [photoFailed, setPhotoFailed] = useState(false);
+  const photoUri = normalizePhotoUri(photo);
+  useEffect(() => setPhotoFailed(false), [photoUri]);
+  if (photoUri && !photoFailed) {
+    return (
+      <Image
+        source={{ uri: photoUri }}
+        resizeMode="cover"
+        onLoad={() => console.info("[PHOTO-RENDER] Avatar chargé.", photoUriDiagnostic(photoUri))}
+        onError={(event) => {
+          console.warn("[PHOTO-RENDER] Échec du chargement de l’avatar.", {
+            ...photoUriDiagnostic(photoUri),
+            error: sanitizePhotoError(event.nativeEvent.error)
+          });
+          setPhotoFailed(true);
+        }}
+        style={styles.childChipPhoto}
+      />
+    );
+  }
+  return (
+    <>
+      <UserRound size={13} color={active ? "#FFFFFF" : palette.green} />
+      <Text style={[styles.childChipText, active && styles.childChipTextActive]}>{name}</Text>
+    </>
   );
 }
 
@@ -272,12 +398,14 @@ function homeworkDocument(content: string): string {
 
 function ChildProfilesBar({
   children,
+  providerAccounts,
   activeChildId,
   onSelectChild,
   onAddChild,
   showAll = true
 }: {
   children: ChildProfile[];
+  providerAccounts: ProviderAccount[];
   activeChildId: string | null;
   onSelectChild: (id: string | null) => void;
   onAddChild: () => void;
@@ -302,19 +430,20 @@ function ChildProfilesBar({
 
         {children.map((child) => {
           const active = activeChildId === child.id;
+          const photo = childProfilePhoto(child, providerAccounts);
           return (
             <Pressable
               key={child.id}
+              accessibilityRole="button"
+              accessibilityLabel={`${child.firstName || "Enfant"} ${child.lastName || ""}`.trim()}
+              accessibilityState={{ selected: active }}
               onPress={() => onSelectChild(child.id)}
               style={[
                 styles.childChip,
                 active && styles.childChipActive
               ]}
             >
-              <UserRound size={13} color={active ? "#FFFFFF" : palette.green} />
-              <Text style={[styles.childChipText, active && styles.childChipTextActive]}>
-                {child.firstName || "Enfant"}
-              </Text>
+              <ChildProfileAvatar photo={photo} active={active} name={child.firstName || "Enfant"} />
             </Pressable>
           );
         })}
@@ -342,7 +471,8 @@ function ProviderSourceSelector({
   const domains: { id: DomainType; label: string }[] = [
     { id: "courses", label: "Emploi du temps" },
     { id: "homeworks", label: "Devoirs" },
-    { id: "grades", label: "Notes" }
+    { id: "grades", label: "Notes" },
+    { id: "photo", label: "Photo de profil" }
   ];
   const providerLabels: Record<ProviderType, string> = {
     ecoleDirecte: "École Directe",
@@ -388,6 +518,7 @@ export default function App() {
   return (
     <SafeAreaProvider>
       <AppContent />
+      <PhotoWebViewHost />
     </SafeAreaProvider>
   );
 }
@@ -422,6 +553,17 @@ function AppContent() {
   const [busy, setBusy] = useState(false);
   const [notice, setNotice] = useState("");
   const [selectedHomework, setSelectedHomework] = useState<{ student: EdPupil; homework: HomeworkItem } | null>(null);
+  const [schoolZone, setSchoolZone] = useState<SchoolZone>("C");
+  const [holidaysOpen, setHolidaysOpen] = useState(false);
+
+  useEffect(() => {
+    void getSavedZone().then(setSchoolZone);
+  }, []);
+
+  const changeSchoolZone = (zone: SchoolZone) => {
+    setSchoolZone(zone);
+    void saveZone(zone);
+  };
   const sessionRef = useRef<EdSession | null>(null);
   const providerSessionsRef = useRef(new Map<string, ProviderSession>());
   const providerAccountsRef = useRef(providerAccounts);
@@ -438,7 +580,14 @@ function AppContent() {
   );
 
   const persistProviderAccounts = async (accounts: ProviderAccount[], remember: boolean) => {
-    const metadata = accounts.map(({ refreshToken: _refreshToken, ...account }) => account);
+    const metadata = accounts.map(({ refreshToken: _refreshToken, ...account }) => ({
+      ...account,
+      // Les photos téléchargées (data URI) sont trop lourdes pour SecureStore.
+      students: account.students.map((student) => ({
+        ...student,
+        photo: student.photo?.startsWith("data:") || account.provider === "pronote" ? undefined : student.photo
+      }))
+    }));
     await SecureStore.setItemAsync(PROVIDER_ACCOUNTS_KEY, JSON.stringify(metadata));
     await Promise.all(accounts.map((account) => {
       const tokenKey = providerTokenKey(account.id);
@@ -481,10 +630,11 @@ function AppContent() {
         ...existing?.links,
         [provider]: { accountId, studentId: student.id }
       };
-      const sources = {
-        courses: existing?.sources.courses ?? provider,
-        homeworks: existing?.sources.homeworks ?? provider,
-        grades: existing?.sources.grades ?? provider
+      const sources: Record<DomainType, ProviderType | null> = {
+        courses: existing?.sources?.courses ?? provider,
+        homeworks: existing?.sources?.homeworks ?? provider,
+        grades: existing?.sources?.grades ?? provider,
+        photo: existing?.sources?.photo ?? provider
       };
       for (const domain of Object.keys(sources) as DomainType[]) {
         const source = sources[domain];
@@ -580,6 +730,7 @@ function AppContent() {
     await SecureStore.setItemAsync(CHILDREN_PROFILES_KEY, JSON.stringify(nextChildren));
     const nextData = await fetchConnectedChildrenData(nextChildren);
     setData(nextData);
+    selectActiveChild(null);
     await scheduleDailyReminders(preferences, nextData).catch(() => false);
   };
 
@@ -626,13 +777,15 @@ function AppContent() {
     remember = rememberCredentials
   ): Promise<ChildProfile[]> => {
     const parentName = [session.student?.prenom, session.student?.nom].filter(Boolean).join(" ") || currentUsername;
-    const students = (session.pupils || []).map((pupil) => ({
-      id: String(pupil.id),
-      firstName: pupil.prenom || "",
-      lastName: pupil.nom || "",
-      className: pupil.classe?.libelle || pupil.classe?.code || "",
-      photo: pupil.photo
-    }));
+    const students = (session.pupils || []).map((pupil) => {
+      return {
+        id: String(pupil.id),
+        firstName: pupil.prenom || "",
+        lastName: pupil.nom || "",
+        className: pupil.classe?.libelle || pupil.classe?.code || "",
+        photo: pupil.photo
+      };
+    });
     return addProviderConnection({
       id: `ecoleDirecte:${normalizeIdentity(currentUsername)}`,
       provider: "ecoleDirecte",
@@ -652,7 +805,7 @@ function AppContent() {
   ): Promise<SchoolData[]> => {
     const combined: SchoolData[] = [];
     for (const [index, child] of childrenToFetch.entries()) {
-      const domainData: Partial<Record<ProviderType, SchoolData>> = {};
+      const domainData: Partial<Record<ProviderType, SchoolData & { studentPhoto?: string }>> = {};
       const errors: string[] = [];
       const selectedProviders = [...new Set(
         Object.values(child.sources).filter((provider): provider is ProviderType => provider !== null)
@@ -705,12 +858,29 @@ function AppContent() {
       const courses = child.sources.courses ? domainData[child.sources.courses]?.courses || [] : [];
       const homeworks = child.sources.homeworks ? domainData[child.sources.homeworks]?.homeworks || [] : [];
       const gradeSource = child.sources.grades ? domainData[child.sources.grades] : undefined;
+
+      const photoProvider = child.sources.photo;
+      const fetchedPhoto = photoProvider
+        ? normalizePhotoUri(domainData[photoProvider]?.studentPhoto || domainData[photoProvider]?.student?.photo)
+        : undefined;
+      const rawPhotoUri = fetchedPhoto || childProfilePhoto(child, providerAccountsRef.current);
+      const photoUri = await inlinePhoto(rawPhotoUri, (photoProvider || "photo").toUpperCase(),
+        photoProvider === "ecoleDirecte"
+          ? { "User-Agent": ED_PHOTO_USER_AGENT, Referer: "https://www.ecoledirecte.com/" }
+          : {});
+      console.info("[PHOTO-RESOLUTION] Photo du profil résolue.", {
+        provider: photoProvider || null,
+        fetchedPhoto: photoUriDiagnostic(fetchedPhoto),
+        resolvedPhoto: photoUriDiagnostic(photoUri)
+      });
+
       const firstSuccessfulData = Object.values(domainData).find(Boolean);
       combined.push({
         student: {
           id: index + 1,
           prenom: child.firstName,
           nom: child.lastName,
+          photo: photoUri,
           classe: { libelle: child.className }
         },
         courses,
@@ -729,6 +899,7 @@ function AppContent() {
   const refreshConnectedChildren = async (timetableDate = selectedDay) => {
     const nextData = await fetchConnectedChildrenData(childrenProfiles, timetableDate);
     setData(nextData);
+    selectActiveChild(null);
     await scheduleDailyReminders(preferences, nextData).catch(() => false);
     return nextData;
   };
@@ -854,6 +1025,7 @@ function AppContent() {
             activePrefs.homeworkDays
           );
           setData(restoredData);
+          selectActiveChild(null);
           await scheduleDailyReminders(activePrefs, restoredData).catch(() => false);
         } catch (error) {
           setNotice(`Synchronisation impossible : ${(error as Error).message}`);
@@ -890,6 +1062,7 @@ function AppContent() {
           preferencesRef.current.homeworkDays
         ).then(async (latestData) => {
           setData(latestData);
+          selectActiveChild(null);
           await scheduleDailyReminders(preferencesRef.current, latestData).catch(() => false);
         }).catch((error) => console.warn("[APP] Could not refresh provider data:", error));
         return;
@@ -902,6 +1075,7 @@ function AppContent() {
           const backgroundTimestamp = Math.max(...backgroundData.map((entry) => Date.parse(entry.syncedAt) || 0));
           if (backgroundTimestamp > currentTimestamp) {
             setData(backgroundData);
+            selectActiveChild(null);
             if (status.selectedDay) {
               const backgroundDay = new Date(status.selectedDay);
               if (!Number.isNaN(backgroundDay.getTime())) setSelectedDay(backgroundDay);
@@ -935,6 +1109,7 @@ function AppContent() {
       setSelectedDay(syncResult.selectedDay);
       const latestData = await fetchConnectedChildrenData(connectedChildren, syncResult.selectedDay, prefsToUse.homeworkDays);
       setData(latestData);
+      selectActiveChild(null);
       await scheduleDailyReminders(prefsToUse, latestData).catch(() => false);
       console.log("[APP] Auto-login & sync complete!");
     } catch (error) {
@@ -1020,6 +1195,7 @@ function AppContent() {
       await scheduleDailyReminders(preferences, null).catch(() => false);
       setNotice(`Compte connecté, mais synchronisation impossible : ${(error as Error).message}`);
     }
+    selectActiveChild(null);
     setTab("journal");
   };
 
@@ -1082,6 +1258,24 @@ function AppContent() {
     setPronoteLoginOpen(true);
   };
 
+  const reconnectAccount = async (account: ProviderAccount) => {
+    if (providerSessionsRef.current.has(account.id)) return;
+    if (account.provider === "pronote") {
+      setPronoteLoginError("");
+      setPronoteLoginOpen(true);
+    } else if (account.provider === "skolengo") {
+      if (account.school) {
+        await connectSkolengoAccount(account.school as NonNullable<SkolengoLoginStart>["school"]);
+      } else {
+        setNotice("Recherche ton établissement Skolengo pour te reconnecter.");
+      }
+    } else if (username.trim() && password) {
+      await connect({ username, password });
+    } else {
+      setNotice("Saisis ton identifiant et ton mot de passe École Directe pour te reconnecter.");
+    }
+  };
+
   const startPronoteSso = () => {
     const base = pronoteBaseUrl(pronoteStartUrl);
     if (!base) {
@@ -1121,6 +1315,7 @@ function AppContent() {
       setTab("journal");
       void fetchConnectedChildrenData(nextChildren).then(async (nextData) => {
         setData(nextData);
+        selectActiveChild(null);
         await scheduleDailyReminders(preferences, nextData).catch(() => false);
       }).catch((error) => {
         setNotice(`Connexion enregistrée, synchronisation impossible : ${(error as Error).message}`);
@@ -1185,6 +1380,7 @@ function AppContent() {
       }, account);
       const nextData = await fetchConnectedChildrenData(nextChildren);
       setData(nextData);
+      selectActiveChild(null);
       await scheduleDailyReminders(preferences, nextData).catch(() => false);
       setSkolengoSchools([]);
       setSchoolSearch("");
@@ -1335,6 +1531,7 @@ function AppContent() {
       }
       setNotice(`Synchronisation impossible : ${(error as Error).message}`);
     } finally {
+      selectActiveChild(null);
       setBusy(false);
     }
   };
@@ -1370,6 +1567,7 @@ function AppContent() {
       try {
         latestData = await fetchConnectedChildrenData(childrenProfiles, selectedDay, normalizedPrefs.homeworkDays);
         setData(latestData);
+        selectActiveChild(null);
       } catch {
         latestData = null;
         syncFailed = true;
@@ -1380,6 +1578,7 @@ function AppContent() {
         setSelectedDay(syncResult.selectedDay);
         latestData = syncResult.data;
         setData(latestData);
+        selectActiveChild(null);
       } catch {
         latestData = null;
         syncFailed = true;
@@ -1461,14 +1660,113 @@ function AppContent() {
   const homeworkCount = visibleData?.reduce((total, studentData) => total + studentData.homeworks.length, 0) ?? 0;
   const gradeCount = visibleData?.filter((studentData) => studentData.latestGrade).length ?? 0;
 
+  const renderHolidaysCard = (currentOnly = false) => {
+    const referenceDate = currentOnly ? new Date() : selectedDay;
+    const { currentHoliday, nextHoliday, daysUntilNext } = getCurrentOrNextHoliday(schoolZone, referenceDate);
+    const dateKey = [
+      referenceDate.getFullYear(),
+      String(referenceDate.getMonth() + 1).padStart(2, "0"),
+      String(referenceDate.getDate()).padStart(2, "0")
+    ].join("-");
+    const holidayList = currentOnly
+      ? currentHoliday ? [currentHoliday] : []
+      : (SCHOOL_HOLIDAYS[schoolZone] || []).filter((holiday) => holiday.endDate > dateKey);
+    return (
+      <View style={styles.holidaysCard}>
+        <View style={styles.holidaysHeader}>
+          <View style={styles.rowContent}>
+            <Text style={styles.holidaysTitle}>
+              {currentHoliday ? "🏖️ Vacances scolaires (En cours)" : "📅 Vacances scolaires"}
+            </Text>
+            <Text style={styles.holidaysStatusText}>
+              {currentHoliday
+                ? `${currentHoliday.name} (reprise le ${shortDate(currentHoliday.endDate)})`
+                : nextHoliday
+                  ? `${nextHoliday.name} dans ${daysUntilNext} jour${(daysUntilNext ?? 0) > 1 ? "s" : ""} (du ${shortDate(nextHoliday.startDate)} au ${shortDate(nextHoliday.endDate)})`
+                  : "Aucune vacances programmées"}
+            </Text>
+          </View>
+          <Pressable
+            accessibilityRole="button"
+            onPress={() => setHolidaysOpen(!holidaysOpen)}
+            style={styles.holidaysToggleBtn}
+          >
+            <Text style={styles.holidaysToggleText}>{holidaysOpen ? "Masquer" : "Voir tout"}</Text>
+            <ChevronDown size={16} color={palette.green} style={{ transform: [{ rotate: holidaysOpen ? "180deg" : "0deg" }] }} />
+          </Pressable>
+        </View>
+
+        <View style={styles.zoneRow}>
+          <Text style={styles.zoneLabel}>Zone :</Text>
+          {(["A", "B", "C"] as SchoolZone[]).map((zone) => {
+            const selected = schoolZone === zone;
+            return (
+              <Pressable
+                key={zone}
+                onPress={() => changeSchoolZone(zone)}
+                style={[styles.zoneChip, selected && styles.zoneChipSelected]}
+              >
+                <Text style={[styles.zoneChipText, selected && styles.zoneChipTextSelected]}>Zone {zone}</Text>
+              </Pressable>
+            );
+          })}
+        </View>
+
+        {holidaysOpen && (
+          <View style={styles.holidaysList}>
+            <Text style={styles.groupCaption}>Calendrier des vacances (Zone {schoolZone})</Text>
+            {holidayList.map((holiday, idx) => {
+              const isCurrent = currentHoliday?.name === holiday.name && currentHoliday?.startDate === holiday.startDate;
+              return (
+                <View key={`${holiday.name}-${idx}`} style={[styles.holidayRow, isCurrent && styles.holidayRowActive]}>
+                  <View style={styles.rowContent}>
+                    <Text style={[styles.rowTitle, isCurrent && styles.holidayActiveText]}>{holiday.name}</Text>
+                    <Text style={styles.rowDetail}>
+                      Du {shortDate(holiday.startDate)} au {shortDate(holiday.endDate)}
+                    </Text>
+                  </View>
+                  {isCurrent && <Text style={styles.holidayBadge}>En cours</Text>}
+                </View>
+              );
+            })}
+          </View>
+        )}
+      </View>
+    );
+  };
+
   const renderProviderManager = () => (
     <View style={styles.parentSpace}>
       <View style={styles.parentSpaceHeading}>
-        <Text style={styles.sectionTitle}>Espace parents</Text>
-        <Text style={styles.rowDetail}>Comptes et sources des données des enfants</Text>
+        <Text style={styles.sectionTitle}>Espace parents & Services</Text>
+        <Text style={styles.rowDetail}>Bascule entre les 3 onglets de services scolaires ci-dessous</Text>
       </View>
 
-      {providerAccounts.map((account) => {
+      <View style={styles.serviceTabRow}>
+        {([
+          ["ecoleDirecte", "École Directe"],
+          ["skolengo", "Skolengo"],
+          ["pronote", "Pronote"]
+        ] as [ProviderType, string][]).map(([provider, label]) => {
+          const selected = selectedProvider === provider;
+          const account = providerAccounts.find((acc) => acc.provider === provider);
+          const isConnected = account && providerSessionsRef.current.has(account.id);
+          return (
+            <Pressable
+              key={provider}
+              accessibilityRole="button"
+              accessibilityState={{ selected }}
+              onPress={() => setSelectedProvider(provider)}
+              style={[styles.serviceTabButton, selected && styles.serviceTabButtonSelected]}
+            >
+              <View style={[styles.statusDot, isConnected ? styles.statusDotConnected : styles.statusDotDisconnected]} />
+              <Text style={[styles.serviceTabText, selected && styles.serviceTabTextSelected]}>{label}</Text>
+            </Pressable>
+          );
+        })}
+      </View>
+
+      {providerAccounts.filter((account) => account.provider === selectedProvider).map((account) => {
         const serviceLabel = account.provider === "ecoleDirecte"
           ? "École Directe"
           : account.provider === "skolengo"
@@ -1480,9 +1778,21 @@ function AppContent() {
               <Text style={styles.rowTitle}>{account.parentName || account.label}</Text>
               <Text style={styles.rowDetail}>{serviceLabel}</Text>
               <Text style={styles.rowDetail}>
-                {providerSessionsRef.current.has(account.id) ? "Connecté" : "À reconnecter"} · {account.students.length} enfant{account.students.length === 1 ? "" : "s"}
+                {providerSessionsRef.current.has(account.id) ? "🟢 Connecté" : "🟠 À reconnecter"} · {account.students.length} enfant{account.students.length === 1 ? "" : "s"}
               </Text>
             </View>
+            {!providerSessionsRef.current.has(account.id) && (
+              <Pressable
+                accessibilityRole="button"
+                accessibilityLabel={`Reconnecter ${serviceLabel}`}
+                onPress={() => void reconnectAccount(account)}
+                disabled={busy}
+                style={styles.providerReconnectButton}
+              >
+                <RefreshCw size={16} color={palette.green} />
+                <Text style={styles.providerReconnectText}>Reconnecter</Text>
+              </Pressable>
+            )}
             <Pressable
               accessibilityRole="button"
               accessibilityLabel={`Déconnecter ${serviceLabel}`}
@@ -1498,29 +1808,7 @@ function AppContent() {
         );
       })}
 
-      <Text style={styles.inputLabel}>Ajouter un service</Text>
-      <View style={styles.serviceProviderRow}>
-        {([
-          ["ecoleDirecte", "École Directe"],
-          ["skolengo", "Skolengo"],
-          ["pronote", "Pronote"]
-        ] as [ProviderType, string][]).map(([provider, label]) => {
-          const selected = selectedProvider === provider;
-          return (
-            <Pressable
-              key={provider}
-              accessibilityRole="button"
-              accessibilityState={{ selected }}
-              onPress={() => setSelectedProvider(provider)}
-              style={[styles.serviceProviderButton, selected && styles.serviceProviderButtonSelected]}
-            >
-              <Text style={[styles.serviceProviderText, selected && styles.serviceProviderTextSelected]}>{label}</Text>
-            </Pressable>
-          );
-        })}
-      </View>
-
-      {selectedProvider === "ecoleDirecte" && (
+      {selectedProvider === "ecoleDirecte" && !providerAccounts.some((acc) => acc.provider === "ecoleDirecte" && providerSessionsRef.current.has(acc.id)) && (
         <>
           <Text style={styles.inputLabel}>Identifiant École Directe</Text>
           <TextInput
@@ -1552,7 +1840,7 @@ function AppContent() {
         </>
       )}
 
-      {selectedProvider === "pronote" && (
+      {selectedProvider === "pronote" && !providerAccounts.some((acc) => acc.provider === "pronote" && providerSessionsRef.current.has(acc.id)) && (
         <>
           <AppButton
             label="Se connecter à Pronote via l’ENT"
@@ -1563,9 +1851,9 @@ function AppContent() {
         </>
       )}
 
-      {selectedProvider === "skolengo" && (
+      {selectedProvider === "skolengo" && !providerAccounts.some((acc) => acc.provider === "skolengo" && providerSessionsRef.current.has(acc.id)) && (
         <>
-          <Text style={styles.inputLabel}>Établissement</Text>
+          <Text style={styles.inputLabel}>Établissement Skolengo</Text>
           <View style={styles.schoolSearchRow}>
             <TextInput
               value={schoolSearch}
@@ -1631,7 +1919,16 @@ function AppContent() {
           <Text style={styles.inputLabel}>Enfants trouvés</Text>
           {childrenProfiles.map((child) => (
             <View key={child.id} style={styles.parentChildRow}>
-              <PupilHeading pupil={{ id: childrenProfiles.indexOf(child) + 1, prenom: child.firstName, nom: child.lastName }} detail={child.className} />
+              <PupilHeading
+                pupil={{
+                  id: childrenProfiles.indexOf(child) + 1,
+                  prenom: child.firstName,
+                  nom: child.lastName,
+                  photo: childProfilePhoto(child, providerAccounts)
+                }}
+                detail={child.className}
+                context="compte"
+              />
               <ProviderSourceSelector
                 child={child}
                 accounts={providerAccounts.filter((account) => providerSessionsRef.current.has(account.id))}
@@ -1697,11 +1994,14 @@ function AppContent() {
     </View>
   );
 
-  const renderJournal = () => (
-    <>
+  const renderJournal = () => {
+    const currentHoliday = getCurrentOrNextHoliday(schoolZone).currentHoliday;
+    return (
+      <>
       {childrenProfiles.length > 0 && (
         <ChildProfilesBar
           children={childrenProfiles}
+          providerAccounts={providerAccounts}
           activeChildId={activeChildId}
           onSelectChild={selectActiveChild}
           onAddChild={() => {
@@ -1709,6 +2009,10 @@ function AppContent() {
           }}
         />
       )}
+      {currentHoliday ? (
+        renderHolidaysCard(true)
+      ) : (
+      <>
       <View style={styles.hero}>
         <View style={styles.heroTopline}>
           <Text style={styles.heroEyebrow}>TON JOUR EN UN COUP D'OEIL</Text>
@@ -1858,7 +2162,12 @@ function AppContent() {
                         <Text style={[styles.rowTitle, isNewGrade(grade.date) && styles.newGradeTitle]}>{grade.subject}</Text>
                         <Text style={styles.rowDetail}>{shortDate(grade.date)}</Text>
                       </View>
-                      <Text style={[styles.gradeValue, isNewGrade(grade.date) && styles.newGradeTitle]}>{grade.value}</Text>
+                      <View style={{ alignItems: "flex-end" }}>
+                        <Text style={[styles.gradeValue, isNewGrade(grade.date) && styles.newGradeTitle]}>{grade.value}</Text>
+                        {!!grade.classAverage && (
+                          <Text style={styles.classAverageText}>{grade.classAverage}</Text>
+                        )}
+                      </View>
                     </View>
                   ))}
                 {studentData.competencies.length > 0 && (
@@ -1880,8 +2189,11 @@ function AppContent() {
           </View>
         ))}
       </View>
+      </>
+      )}
     </>
-  );
+    );
+  };
 
   const renderReminders = () => (
     <>
@@ -1938,6 +2250,10 @@ function AppContent() {
         color={palette.blue}
         onTime={(time) => updateReminder("grades", { time })}
         onEnabled={(enabled) => updateReminder("grades", { enabled })}
+      />
+      <PauseCard
+        freeze={preferences.freeze}
+        onChange={(freeze) => setPreferences((current) => ({ ...current, freeze }))}
       />
       <View style={styles.reminderNote}>
         <Bell size={17} color={palette.green} />
@@ -2045,6 +2361,7 @@ function AppContent() {
         </View>
       )}
       {renderProviderManager()}
+      {renderHolidaysCard()}
       <View style={styles.privacyNote}>
         <Text style={styles.privacyTitle}>Tes données restent sur ton téléphone</Text>
         <Text style={styles.privacyCopy}>
@@ -2133,6 +2450,83 @@ function AppContent() {
       </View>
       </KeyboardAvoidingView>
     </SafeAreaView>
+  );
+}
+
+function isoToFrench(iso: string): string {
+  const match = iso.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  return match ? `${match[3]}/${match[2]}/${match[1]}` : "";
+}
+
+function frenchToIso(text: string): string {
+  const match = text.trim().match(/^(\d{2})\/(\d{2})\/(\d{4})$/);
+  if (!match) return "";
+  const [, day, month, year] = match;
+  const date = new Date(Number(year), Number(month) - 1, Number(day));
+  const valid = date.getFullYear() === Number(year) && date.getMonth() === Number(month) - 1 && date.getDate() === Number(day);
+  return valid ? `${year}-${month}-${day}` : "";
+}
+
+function PauseDateInput({ label, iso, onChange }: { label: string; iso: string; onChange: (iso: string) => void }) {
+  const [text, setText] = useState(isoToFrench(iso));
+  useEffect(() => {
+    if (iso) setText(isoToFrench(iso));
+  }, [iso]);
+  const invalid = text.length === 10 && !frenchToIso(text);
+  return (
+    <View style={styles.pauseDateField}>
+      <Text style={styles.rowDetail}>{label}</Text>
+      <TextInput
+        accessibilityLabel={label}
+        value={text}
+        onChangeText={(value) => {
+          setText(value);
+          onChange(frenchToIso(value));
+        }}
+        placeholder="JJ/MM/AAAA"
+        keyboardType="numbers-and-punctuation"
+        maxLength={10}
+        style={[styles.pauseDateInput, invalid && styles.pauseDateInvalid]}
+      />
+    </View>
+  );
+}
+
+function PauseCard({
+  freeze,
+  onChange
+}: {
+  freeze: ReminderPreferences["freeze"];
+  onChange: (freeze: NonNullable<ReminderPreferences["freeze"]>) => void;
+}) {
+  const current = freeze ?? { enabled: false, startDate: "", endDate: "" };
+  const incomplete = current.enabled && (!current.startDate || !current.endDate || current.endDate < current.startDate);
+  return (
+    <View style={styles.pauseCard}>
+      <View style={styles.settingsToggleRow}>
+        <View style={styles.rowContent}>
+          <Text style={styles.rowTitle}>Mettre en pause</Text>
+          <Text style={styles.rowDetail}>Aucune notification entre deux dates (incluses).</Text>
+        </View>
+        <Switch
+          value={current.enabled}
+          onValueChange={(enabled) => onChange({ ...current, enabled })}
+          trackColor={{ false: "#D4DBD7", true: "#76CBB0" }}
+          thumbColor={current.enabled ? palette.green : "#FFFFFF"}
+        />
+      </View>
+      {current.enabled && (
+        <>
+          <View style={styles.pauseDates}>
+            <PauseDateInput label="Du" iso={current.startDate} onChange={(startDate) => onChange({ ...current, startDate })} />
+            <PauseDateInput label="Au" iso={current.endDate} onChange={(endDate) => onChange({ ...current, endDate })} />
+          </View>
+          {incomplete && (
+            <Text style={styles.settingsHint}>Saisis deux dates valides, la fin après le début. Sinon la pause est ignorée.</Text>
+          )}
+        </>
+      )}
+    </View>
   );
 }
 
@@ -2251,6 +2645,11 @@ const styles = StyleSheet.create({
   reminderAccent: { width: 4, height: 39, borderRadius: 2, marginRight: 2 },
   timeInput: { minWidth: 57, color: palette.ink, fontSize: 14, fontWeight: "700", textAlign: "center", backgroundColor: palette.background, borderRadius: 8, paddingHorizontal: 5, paddingVertical: 8 },
   horizonRow: { minHeight: 75, flexDirection: "row", alignItems: "center", backgroundColor: "#FFFFFF", borderBottomWidth: 1, borderColor: palette.line, paddingHorizontal: 14 },
+  pauseCard: { backgroundColor: "#FFFFFF", borderRadius: 12, borderWidth: 1, borderColor: palette.line, paddingHorizontal: 14, paddingVertical: 8, marginTop: 17 },
+  pauseDates: { flexDirection: "row", gap: 12, paddingBottom: 10 },
+  pauseDateField: { flex: 1 },
+  pauseDateInput: { color: palette.ink, fontSize: 14, fontWeight: "700", backgroundColor: palette.background, borderRadius: 8, paddingHorizontal: 10, paddingVertical: 8, marginTop: 4 },
+  pauseDateInvalid: { borderWidth: 1, borderColor: palette.coral },
   stepper: { flexDirection: "row", alignItems: "center", gap: 11 },
   stepButton: { width: 30, height: 30, borderRadius: 9, backgroundColor: palette.background, alignItems: "center", justifyContent: "center" },
   stepValue: { color: palette.ink, fontSize: 14, fontWeight: "800", minWidth: 15, textAlign: "center" },
@@ -2288,6 +2687,7 @@ const styles = StyleSheet.create({
   childBarScroll: { flexDirection: "row", gap: 8, paddingHorizontal: 2 },
   childChip: { flexDirection: "row", alignItems: "center", gap: 6, paddingVertical: 8, paddingHorizontal: 12, borderRadius: 20, borderWidth: 1, borderColor: palette.line, backgroundColor: "#FFFFFF" },
   childChipActive: { backgroundColor: palette.green, borderColor: palette.green },
+  childChipPhoto: { width: 20, height: 20, borderRadius: 10, backgroundColor: "#E2F1EA" },
   childChipText: { fontSize: 12, fontWeight: "700", color: palette.ink },
   childChipTextActive: { color: "#FFFFFF" },
   childChipAdd: { flexDirection: "row", alignItems: "center", gap: 4, paddingVertical: 8, paddingHorizontal: 12, borderRadius: 20, borderWidth: 1, borderColor: palette.line, backgroundColor: "#E7F2ED" },
@@ -2316,6 +2716,8 @@ const styles = StyleSheet.create({
   pronoteLoginError: { color: palette.coral, fontSize: 12, lineHeight: 17, marginBottom: 10 },
   providerAccountRow: { minHeight: 60, flexDirection: "row", alignItems: "center", gap: 10, paddingVertical: 8, borderBottomWidth: 1, borderBottomColor: palette.line },
   providerDisconnectButton: { width: 38, height: 38, alignItems: "center", justifyContent: "center", borderRadius: 9, backgroundColor: "#F8E8E0" },
+  providerReconnectButton: { height: 38, flexDirection: "row", alignItems: "center", gap: 6, paddingHorizontal: 10, borderRadius: 9, backgroundColor: "#E4F3EC", marginRight: 8 },
+  providerReconnectText: { color: palette.green, fontSize: 13, fontWeight: "800" },
   serviceProviderRow: { flexDirection: "row", gap: 6, marginBottom: 14 },
   serviceProviderButton: { flex: 1, minHeight: 40, alignItems: "center", justifyContent: "center", paddingHorizontal: 5, borderRadius: 8, borderWidth: 1, borderColor: palette.line, backgroundColor: palette.background },
   serviceProviderButtonSelected: { borderColor: palette.green, backgroundColor: palette.green },
@@ -2346,5 +2748,30 @@ const styles = StyleSheet.create({
   tabItem: { flex: 1, alignItems: "center", justifyContent: "center", gap: 4, position: "relative" },
   tabLabel: { color: palette.muted, fontSize: 10, fontWeight: "600" },
   tabLabelSelected: { color: palette.green, fontWeight: "800" },
-  tabIndicator: { position: "absolute", top: 0, width: 24, height: 2, borderRadius: 1, backgroundColor: palette.green }
+  tabIndicator: { position: "absolute", top: 0, width: 24, height: 2, borderRadius: 1, backgroundColor: palette.green },
+  serviceTabRow: { flexDirection: "row", gap: 8, marginBottom: 16 },
+  serviceTabButton: { flex: 1, minHeight: 46, flexDirection: "row", alignItems: "center", justifyContent: "center", gap: 6, paddingHorizontal: 6, borderRadius: 10, borderWidth: 1.5, borderColor: palette.line, backgroundColor: palette.background },
+  serviceTabButtonSelected: { borderColor: palette.green, backgroundColor: palette.green },
+  serviceTabText: { color: palette.ink, fontSize: 11, fontWeight: "700" },
+  serviceTabTextSelected: { color: "#FFFFFF" },
+  statusDot: { width: 8, height: 8, borderRadius: 4 },
+  statusDotConnected: { backgroundColor: "#2ECC71" },
+  statusDotDisconnected: { backgroundColor: "#BDC3C7" },
+  holidaysCard: { marginTop: 16, marginBottom: 16, padding: 15, borderRadius: 14, borderWidth: 1, borderColor: palette.line, backgroundColor: "#FFFFFF" },
+  holidaysHeader: { flexDirection: "row", alignItems: "flex-start", justifyContent: "space-between", gap: 10 },
+  holidaysTitle: { color: palette.ink, fontSize: 14, fontWeight: "800" },
+  holidaysStatusText: { color: palette.muted, fontSize: 11, lineHeight: 16, marginTop: 4 },
+  holidaysToggleBtn: { flexDirection: "row", alignItems: "center", gap: 4, paddingVertical: 4, paddingHorizontal: 8, borderRadius: 6, backgroundColor: "#E7F2ED" },
+  holidaysToggleText: { color: palette.green, fontSize: 10, fontWeight: "700" },
+  zoneRow: { flexDirection: "row", alignItems: "center", gap: 8, marginTop: 12 },
+  zoneLabel: { color: palette.muted, fontSize: 11, fontWeight: "700" },
+  zoneChip: { paddingVertical: 5, paddingHorizontal: 10, borderRadius: 14, borderWidth: 1, borderColor: palette.line, backgroundColor: palette.background },
+  zoneChipSelected: { borderColor: palette.green, backgroundColor: palette.green },
+  zoneChipText: { color: palette.ink, fontSize: 11, fontWeight: "700" },
+  zoneChipTextSelected: { color: "#FFFFFF" },
+  holidaysList: { marginTop: 14, paddingTop: 10, borderTopWidth: 1, borderTopColor: palette.line },
+  holidayRow: { flexDirection: "row", alignItems: "center", justifyContent: "space-between", paddingVertical: 8, borderBottomWidth: 1, borderBottomColor: palette.line },
+  holidayRowActive: { backgroundColor: "#E7F2ED", paddingHorizontal: 8, borderRadius: 8 },
+  holidayActiveText: { color: palette.green, fontWeight: "800" },
+  holidayBadge: { fontSize: 10, fontWeight: "800", color: palette.green, backgroundColor: "#CBEBDC", paddingVertical: 2, paddingHorizontal: 6, borderRadius: 4 }
 });

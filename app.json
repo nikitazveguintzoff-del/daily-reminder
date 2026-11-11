@@ -2,7 +2,7 @@
   "expo": {
     "name": "Tempo",
     "slug": "daily-reminder",
-    "version": "1.1.0",
+    "version": "1.2.0",
     "orientation": "portrait",
     "scheme": ["tempo", "skoapp-prod"],
     "userInterfaceStyle": "light",

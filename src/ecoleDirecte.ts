@@ -1,4 +1,5 @@
 import { Buffer } from "buffer";
+import { inlinePhoto } from "./photos";
 import { Client, Require2FA } from "@blockshub/blocksdirecte";
 
 const runtimeGlobal = globalThis as typeof globalThis & { Buffer?: typeof Buffer };
@@ -41,6 +42,14 @@ export type EdPupil = {
   classe?: { libelle?: string; code?: string };
 };
 
+export function formatEcoleDirectePhoto(photo?: string): string | undefined {
+  if (!photo) return undefined;
+  if (photo.startsWith("data:image") || photo.startsWith("http")) return photo;
+  if (photo.startsWith("//")) return `https:${photo}`;
+  if (photo.startsWith("/")) return `https://www.ecoledirecte.com${photo}`;
+  return photo;
+}
+
 export type SchoolData = {
   student: EdPupil;
   courses: CourseItem[];
@@ -52,6 +61,30 @@ export type SchoolData = {
   error?: string;
   errorCode?: number;
   gradesError?: string;
+};
+
+type EcoleDirecteGradeData = {
+  notes?: {
+    libelleMatiere?: string;
+    valeur?: string;
+    noteSur?: string;
+    dateSaisie?: string;
+    date?: string;
+    moyenneClasse?: string | number | null;
+    elementsProgramme?: CompetenceItem[];
+    elementsProg?: CompetenceItem[];
+  }[];
+  periodes?: {
+    periode?: string;
+    ensembleMatieres?: {
+      moyenneClasse?: string | number;
+      disciplines?: {
+        discipline?: string;
+        moyenneClasse?: string | number;
+      }[];
+    };
+  }[];
+  LSUN?: Record<string, CompetenceItem[]>;
 };
 
 type StudentAccount = EdPupil & {
@@ -87,7 +120,7 @@ type ApiResponse<T> = {
 
 const API_BASE = "https://api.ecoledirecte.com";
 const API_VERSION = "8.0.0";
-const USER_AGENT =
+export const USER_AGENT =
   "BlocksDirecte/1.0 (iPhone; CPU iPhone OS 18_7 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148  EDMOBILE v8.0.0";
 
 export class EdApiError extends Error {
@@ -383,20 +416,12 @@ export async function fetchSchoolData(
           .catch(() => ({ key, result: { matieres: [] } }));
       })
     ),
-    request<{
-      notes?: {
-        libelleMatiere?: string;
-        valeur?: string;
-        noteSur?: string;
-        dateSaisie?: string;
-        date?: string;
-        elementsProgramme?: CompetenceItem[];
-        elementsProg?: CompetenceItem[];
-      }[];
-      LSUN?: Record<string, CompetenceItem[]>;
-    }>(session, `/v3/eleves/${studentId}/notes.awp`, "get", {
-      anneeScolaire: ""
-    })
+    request<EcoleDirecteGradeData>(
+      session,
+      `/v3/eleves/${studentId}/notes.awp`,
+      "get",
+      { anneeScolaire: "" }
+    )
   ]);
 
   const mappedCourses = courses.map((course) => ({
@@ -439,10 +464,14 @@ export async function fetchSchoolData(
     const date = note.dateSaisie || note.date || "";
     const timestamp = parseEdDate(date);
     if (timestamp < thirtyDaysAgo || timestamp > now) return [];
+    const classAverage = note.moyenneClasse === undefined || note.moyenneClasse === null || note.moyenneClasse === ""
+      ? undefined
+      : `Moy. classe : ${note.moyenneClasse}${note.noteSur ? ` / ${note.noteSur}` : ""}`;
     return [{
       subject: note.libelleMatiere || "Note",
       value: `${note.valeur ?? ""}${note.noteSur ? ` / ${note.noteSur}` : ""}`,
-      date
+      date,
+      ...(classAverage ? { classAverage } : {})
     }];
   });
   const competencyRecords = [
@@ -464,7 +493,13 @@ export async function fetchSchoolData(
   });
 
   return {
-    student,
+    student: {
+      ...student,
+      photo: await inlinePhoto(formatEcoleDirectePhoto(student.photo), "ECOLEDIRECTE", {
+        "User-Agent": USER_AGENT,
+        Referer: "https://www.ecoledirecte.com/"
+      })
+    },
     courses: mappedCourses,
     homeworks,
     grades,

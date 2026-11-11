@@ -53,26 +53,40 @@ export async function scheduleDailyReminders(
 
     await Notifications.cancelAllScheduledNotificationsAsync();
 
-    const candidates = createReminderNotifications(preferences, data, new Date());
+    const candidates = createReminderNotifications(preferences, data, new Date(), true);
+    const pauseRange = activePauseRange(preferences);
 
     for (const reminder of candidates) {
       const normalized = normalizeTime(reminder.time);
       const [hour, minute] = normalized.split(":").map(Number);
       if (!Number.isInteger(hour) || !Number.isInteger(minute)) continue;
 
-      await Notifications.scheduleNotificationAsync({
-        content: {
-          title: reminder.title,
-          body: reminder.body,
-          sound: true,
-          data: { screen: reminder.key }
-        },
-        trigger: {
-          type: Notifications.SchedulableTriggerInputTypes.DAILY,
-          hour,
-          minute
-        }
-      });
+      const content = {
+        title: reminder.title,
+        body: reminder.body,
+        sound: true,
+        data: { screen: reminder.key }
+      };
+
+      if (!pauseRange) {
+        await Notifications.scheduleNotificationAsync({
+          content,
+          trigger: { type: Notifications.SchedulableTriggerInputTypes.DAILY, hour, minute }
+        });
+        continue;
+      }
+
+      // Un déclencheur quotidien ne peut pas sauter une plage de dates : on planifie chaque jour hors pause.
+      const now = new Date();
+      for (let offset = 0; offset < PAUSE_SCHEDULE_DAYS; offset++) {
+        const when = new Date(now.getFullYear(), now.getMonth(), now.getDate() + offset, hour, minute, 0, 0);
+        const key = localDayKey(when);
+        if (when.getTime() <= now.getTime() || (key >= pauseRange.startDate && key <= pauseRange.endDate)) continue;
+        await Notifications.scheduleNotificationAsync({
+          content,
+          trigger: { type: Notifications.SchedulableTriggerInputTypes.DATE, date: when }
+        });
+      }
     }
 
     return true;
@@ -87,6 +101,16 @@ function localDayKey(date: Date): string {
   const month = String(date.getMonth() + 1).padStart(2, "0");
   const day = String(date.getDate()).padStart(2, "0");
   return `${year}-${month}-${day}`;
+}
+
+const PAUSE_SCHEDULE_DAYS = 21;
+
+// Renvoie la pause si elle est activée, valide et pas encore terminée.
+export function activePauseRange(preferences: ReminderPreferences, today = new Date()): { startDate: string; endDate: string } | null {
+  const freeze = preferences.freeze;
+  if (!freeze?.enabled || !freeze.startDate || !freeze.endDate) return null;
+  if (freeze.endDate < freeze.startDate || freeze.endDate < localDayKey(today)) return null;
+  return { startDate: freeze.startDate, endDate: freeze.endDate };
 }
 
 function dateTimestamp(value: string): number {
@@ -172,18 +196,19 @@ function buildGradesBody(data: SchoolData[] | null, dayKey: string): string {
 function createReminderNotifications(
   preferences: ReminderPreferences,
   data: SchoolData[] | null,
-  now: Date
+  now: Date,
+  ignorePauseToday = false
 ): ReminderNotification[] {
   const dayKey = localDayKey(now);
   const tomorrow = new Date(now);
   tomorrow.setDate(tomorrow.getDate() + 1);
   const tomorrowKey = localDayKey(tomorrow);
 
-  if (preferences.freeze?.enabled && preferences.freeze.startDate && preferences.freeze.endDate) {
-    if (dayKey >= preferences.freeze.startDate && dayKey <= preferences.freeze.endDate) {
-      console.log("[REMINDERS] Notifications gelées jusqu'au", preferences.freeze.endDate);
-      return [];
-    }
+  const pause = activePauseRange(preferences, now);
+  // La planification filtre elle-même les jours en pause ; les envois immédiats les bloquent ici.
+  if (!ignorePauseToday && pause && dayKey >= pause.startDate && dayKey <= pause.endDate) {
+    console.log("[REMINDERS] Notifications en pause jusqu'au", pause.endDate);
+    return [];
   }
 
   return [

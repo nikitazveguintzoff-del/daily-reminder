@@ -1,4 +1,5 @@
 import { Buffer } from "buffer";
+import { inlinePhoto } from "../photos";
 import * as Crypto from "expo-crypto";
 import * as SecureStore from "expo-secure-store";
 import { ParentClient } from "pronotets";
@@ -28,23 +29,119 @@ export type PronoteConnection = {
 
 type PronoteSnapshot = { v: 4; url: string; username: string; token: string; uuid: string };
 
-function pronoteStudents(session: ParentClient): ProviderStudent[] {
-  return session.children.map((child) => ({
-    id: child.id,
-    firstName: child.name.split(" ")[0] || child.name,
-    lastName: child.name.split(" ").slice(1).join(" "),
-    className: child.className,
-    photo: child.profilePicture?.url
-  }));
+function normalizePhotoUrl(url?: string, baseUrl?: string): string | undefined {
+  const value = url?.trim();
+  if (!value) return undefined;
+  if (value.startsWith("data:") || value.startsWith("http://") || value.startsWith("https://")) return value;
+  if (value.startsWith("//")) return `https:${value}`;
+  if (baseUrl) {
+    try {
+      const parsed = new URL(baseUrl);
+      return `${parsed.origin}${value.startsWith("/") ? "" : "/"}${value}`;
+    } catch {
+      // ignore
+    }
+  }
+  return value;
 }
 
-function pronoteConnection(session: ParentClient, credentials: PronoteSnapshot): PronoteConnection {
+function photoDiagnostic(value: unknown): { type: string; present: boolean; length?: number; kind?: string; fields?: string[] } {
+  if (typeof value !== "string") {
+    return {
+      type: value === null ? "null" : typeof value,
+      present: value !== undefined && value !== null,
+      ...(value && typeof value === "object" ? { fields: Object.keys(value) } : {})
+    };
+  }
+  const photo = value.trim();
+  return {
+    type: "string",
+    present: photo.length > 0,
+    length: photo.length,
+    kind: /^data:image\//i.test(photo)
+      ? "data-uri"
+      : /^https?:\/\//i.test(photo)
+        ? "absolute-url"
+        : photo.startsWith("//")
+          ? "protocol-relative-url"
+          : photo.startsWith("/")
+            ? "relative-path"
+            : /^[A-Za-z0-9+/=_-]+$/.test(photo)
+              ? "base64-like"
+              : "other"
+  };
+}
+
+function pronoteStudents(session: ParentClient): ProviderStudent[] {
+  console.info("[PRONOTE-PHOTO] Inspection des profils élèves.", {
+    childCount: session.children.length
+  });
+  return session.children.map((child, index) => {
+    const rawChild = child as unknown as Record<string, unknown>;
+    const profilePicture = rawChild.profilePicture;
+    const profilePictureUrl = profilePicture && typeof profilePicture === "object"
+      ? (profilePicture as { url?: unknown }).url
+      : undefined;
+    const photoField = profilePictureUrl
+      ? "profilePicture.url"
+      : typeof rawChild.avatar === "string" && rawChild.avatar
+        ? "avatar"
+        : typeof rawChild.photo === "string" && rawChild.photo
+          ? "photo"
+          : typeof profilePicture === "string" && profilePicture
+            ? "profilePicture"
+            : undefined;
+    const photoValue = profilePictureUrl || (photoField ? rawChild[photoField.split(".")[0]] : undefined);
+    const rawPhoto = typeof photoValue === "string" ? photoValue : undefined;
+    const baseUrl = (session as unknown as { readData?: { url?: string } }).readData?.url;
+    const normalizedPhoto = normalizePhotoUrl(rawPhoto, baseUrl);
+    console.info("[PRONOTE-PHOTO] Profil élève inspecté.", {
+      index,
+      fields: Object.keys(rawChild),
+      profilePicture: photoDiagnostic(profilePicture),
+      photoField: photoField || null,
+      photo: photoDiagnostic(photoValue),
+      normalized: !!normalizedPhoto,
+      normalizedKind: photoDiagnostic(normalizedPhoto).kind || null
+    });
+    const nameParts = child.name.split(" ");
+    return {
+      id: child.id,
+      firstName: nameParts[0] || child.name,
+      lastName: nameParts.slice(1).join(" "),
+      className: child.className || "",
+      photo: normalizedPhoto
+    };
+  });
+}
+
+// L'URL de la photo n'est valable qu'avec la session Pronote : on la télécharge via le client.
+async function pronotePhotoData(child: unknown): Promise<string | undefined> {
+  try {
+    const attachment = (child as { profilePicture?: { data?: () => Promise<Uint8Array> } | null }).profilePicture;
+    if (!attachment || typeof attachment.data !== "function") return undefined;
+    const bytes = Buffer.from(await attachment.data());
+    if (bytes.length < 100) return undefined;
+    const mime = bytes[0] === 0x89 && bytes[1] === 0x50 ? "image/png" : "image/jpeg";
+    return `data:${mime};base64,${bytes.toString("base64")}`;
+  } catch {
+    return undefined;
+  }
+}
+
+async function pronoteConnection(session: ParentClient, credentials: PronoteSnapshot): Promise<PronoteConnection> {
+  const students = await Promise.all(
+    pronoteStudents(session).map(async (student, index) => ({
+      ...student,
+      photo: (await pronotePhotoData(session.children[index])) ?? (await inlinePhoto(student.photo, "PRONOTE"))
+    }))
+  );
   return {
     session,
     url: credentials.url,
     parentName: session.info.name || "Compte parent",
     refreshToken: JSON.stringify(credentials),
-    students: pronoteStudents(session)
+    students
   };
 }
 
@@ -151,7 +248,7 @@ async function loginWithToken(snapshot: PronoteSnapshot, reason: "connect" | "re
     pronoteLog(`${reason}: login succeeded`, { ms: Date.now() - startedAt, children: session.children.length });
     // Tokens are single-use: the renewed one must replace the saved one.
     const renewed = session.exportCredentials();
-    return pronoteConnection(session, {
+    return await pronoteConnection(session, {
       v: 4,
       url: snapshot.url,
       username: renewed.username,
@@ -308,24 +405,59 @@ function toLocalDateTime(value: Date | string): string {
   return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
 }
 
+function formatSkolengoHomeworkContent(raw: Record<string, unknown>): string {
+  const title = String(raw.title || "").trim();
+  const consigne = String(raw.consigne || raw.instructions || "").trim();
+  const exercice = String(raw.exercice || raw.exercise || "").trim();
+  const description = String(raw.description || raw.details || raw.content || "").trim();
+  const html = String(raw.html || "").trim();
+  const onlineUrl = String(raw.onlineDeliveryUrl || "").trim();
+  const deliverOnline = Boolean(raw.deliverWorkOnline || raw.onlineDeliveryUrl);
+
+  const parts: string[] = [];
+
+  if (title && !consigne.includes(title) && !exercice.includes(title) && !html.includes(title)) {
+    parts.push(`<h4 style="margin:0 0 8px 0;color:#0F604D;font-size:16px;">${title}</h4>`);
+  }
+  if (consigne) {
+    parts.push(`<div><strong>Consigne :</strong> ${consigne}</div>`);
+  }
+  if (exercice) {
+    parts.push(`<div><strong>Exercice :</strong> ${exercice}</div>`);
+  }
+  if (description && !consigne.includes(description) && !exercice.includes(description)) {
+    parts.push(`<div>${description}</div>`);
+  }
+  if (html && !parts.some((part) => part.includes(html))) {
+    parts.push(`<div>${html}</div>`);
+  }
+  if (deliverOnline || onlineUrl) {
+    parts.push(`<div style="margin-top:10px;padding:8px 12px;background-color:#EBF5F2;border-radius:8px;color:#16866A;font-weight:600;">💻 Travail à rendre en ligne${onlineUrl ? ` : <a href="${onlineUrl}" target="_blank" style="color:#16866A;">Lien de rendu</a>` : ""}</div>`);
+  }
+
+  return parts.join("<br/>") || html || title || "Aucun détail fourni.";
+}
+
 async function fetchSkolengoAgenda(
   student: Skolengo,
   studentId: string,
-  date: Date
+  date: Date,
+  endDate?: Date
 ): Promise<SkolengoAgendaData> {
   await student.refreshAccessToken();
   const { accessToken, school } = student as unknown as { accessToken: string; school: School };
   const dateKey = date.toISOString().slice(0, 10);
+  const endDateKey = (endDate || date).toISOString().slice(0, 10);
   const query = new URLSearchParams({
-    "page[limit]": "50",
+    "page[limit]": "100",
     include: "lessons,lessons.subject,lessons.teachers,homeworkAssignments,homeworkAssignments.subject",
     "fields[cateringService]": "title,startDateTime,endDateTime",
     "fields[lesson]": "title,startDateTime,endDateTime,location,canceled,anyContent,anyHomeworkToDoForTheLesson,anyHomeworkToDoAfterTheLesson,subject,teachers",
-    "fields[homework]": "title,done,dueDateTime,subject,html,deliverWorkOnline,onlineDeliveryUrl",
+    "fields[homework]": "title,done,dueDateTime,subject,html,consigne,instructions,exercice,exercise,description,details,deliverWorkOnline,onlineDeliveryUrl",
     "fields[teacher]": "firstName,lastName,title",
     "filter[date][GE]": dateKey,
     "filter[student.id]": studentId,
-    "filter[date][LE]": dateKey,
+    "filter[date][LE]": endDateKey,
     "fields[subject]": "label,color"
   });
   const response = await fetch(`https://api.skolengo.com/api/v1/bff-sko-app/agendas?${query}`, {
@@ -363,12 +495,7 @@ async function fetchSkolengoAgenda(
       if (!homework) continue;
       const attributes = homework.attributes || {};
       const subject = included.get(`subject:${relationId(homework, "subject") || ""}`);
-      const consigne = String(attributes.consigne || attributes.instructions || "");
-      const exercice = String(attributes.exercice || attributes.exercise || attributes.html || "");
-      const content = [
-        consigne ? `<p><strong>Consigne :</strong> ${consigne}</p>` : "",
-        exercice ? `<p><strong>Exercice :</strong> ${exercice}</p>` : ""
-      ].filter(Boolean).join("") || String(attributes.html || "");
+      const content = formatSkolengoHomeworkContent(attributes);
       homeworks.set(id, {
         id,
         subject: String(subject?.attributes?.label || attributes.title || "Devoir"),
@@ -459,13 +586,30 @@ async function fetchPronoteDataNow(
     done: assignment.done
   }));
   const mappedGrades: GradeItem[] = grades.map((grade) => {
-    const rawGrade = grade as unknown as { average?: string; classAverage?: string; outOf?: number };
-    const avg = rawGrade.classAverage || (rawGrade.average ? `${rawGrade.average}${grade.outOf ? ` / ${grade.outOf}` : ""}` : undefined);
+    const rawGrade = grade as unknown as Record<string, unknown>;
+    let classAvgRaw: string | undefined;
+
+    if (typeof rawGrade.classAverage === "string" || typeof rawGrade.classAverage === "number") {
+      classAvgRaw = String(rawGrade.classAverage);
+    } else if (typeof rawGrade.average === "string" || typeof rawGrade.average === "number") {
+      classAvgRaw = String(rawGrade.average);
+    } else if (rawGrade.average && typeof rawGrade.average === "object") {
+      const avgObj = rawGrade.average as Record<string, unknown>;
+      classAvgRaw = String(avgObj.value || avgObj.average || avgObj.val || "");
+    } else if (rawGrade.averages && typeof rawGrade.averages === "object") {
+      const avgObj = rawGrade.averages as Record<string, unknown>;
+      classAvgRaw = String(avgObj.average || avgObj.value || "");
+    }
+
+    const classAverage = classAvgRaw && classAvgRaw !== "undefined"
+      ? `Moy. classe : ${classAvgRaw}${grade.outOf && !classAvgRaw.includes("/") ? ` / ${grade.outOf}` : ""}`
+      : undefined;
+
     return {
       subject: grade.subject.name,
       value: `${grade.grade}${grade.outOf ? ` / ${grade.outOf}` : ""}`,
       date: grade.date.toISOString(),
-      ...(avg ? { classAverage: `Moy. classe : ${avg}` } : {})
+      ...(classAverage ? { classAverage } : {})
     };
   });
 
@@ -473,7 +617,13 @@ async function fetchPronoteDataNow(
   homeworks.sort((a, b) => a.dueDate.localeCompare(b.dueDate));
   mappedGrades.sort((a, b) => b.date.localeCompare(a.date));
 
-  return { courses, homeworks, grades: mappedGrades, competencies: [] };
+  const rawChild = student as unknown as Record<string, unknown>;
+  const rawPhoto = (student.profilePicture as { url?: string } | undefined)?.url ||
+    String(rawChild.avatar || rawChild.photo || rawChild.profilePicture || "");
+  const studentPhoto = (await pronotePhotoData(student)) ??
+    normalizePhotoUrl(rawPhoto, (session as unknown as { readData?: { url?: string } }).readData?.url);
+
+  return { courses, homeworks, grades: mappedGrades, competencies: [], studentPhoto };
 }
 
 export async function fetchSkolengoData(
@@ -486,7 +636,8 @@ export async function fetchSkolengoData(
   if (!student) throw new Error("Élève Skolengo introuvable dans cette connexion.");
   const homeworkEnd = new Date(timetableDate);
   homeworkEnd.setDate(homeworkEnd.getDate() + homeworkDays);
-  const agenda = await fetchSkolengoAgenda(student, studentId, timetableDate);
+  homeworkEnd.setHours(23, 59, 59, 999);
+  const agenda = await fetchSkolengoAgenda(student, studentId, timetableDate, homeworkEnd);
   let assignments: Awaited<ReturnType<Skolengo["GetAssignments"]>>;
   try {
     assignments = await student.GetAssignments(timetableDate, homeworkEnd);
@@ -503,21 +654,16 @@ export async function fetchSkolengoData(
   }
   const homeworkItems = new Map(agenda.homeworks.map((homework) => [homework.id, homework]));
   for (const assignment of assignments) {
-    const rawAssignment = assignment as unknown as { consigne?: string; exercice?: string; html: string };
-    const consigne = String(rawAssignment.consigne || "");
-    const exercice = String(rawAssignment.exercice || rawAssignment.html || "");
-    const content = [
-      consigne ? `<p><strong>Consigne :</strong> ${consigne}</p>` : "",
-      exercice ? `<p><strong>Exercice :</strong> ${exercice}</p>` : ""
-    ].filter(Boolean).join("") || rawAssignment.html;
+    const rawAssignment = assignment as unknown as Record<string, unknown>;
+    const content = formatSkolengoHomeworkContent(rawAssignment);
 
     homeworkItems.set(assignment.id, {
       id: assignment.id,
-      subject: assignment.subject.label || assignment.title || "Devoir",
+      subject: assignment.subject?.label || assignment.title || "Devoir",
       content,
       preview: homeworkPreview(content),
       dueDate: assignment.dueDateTime.toISOString(),
-      done: assignment.done
+      done: Boolean(assignment.done)
     });
   }
   return {

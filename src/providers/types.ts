@@ -3,7 +3,7 @@ import type { ParentClient } from "pronotets";
 import type { School, Skolengo } from "skolengojs";
 
 export type ProviderType = "ecoleDirecte" | "skolengo" | "pronote";
-export type DomainType = "courses" | "homeworks" | "grades";
+export type DomainType = "courses" | "homeworks" | "grades" | "photo";
 
 export type ProviderStudent = {
   id: string;
@@ -45,7 +45,9 @@ export type ProviderAccount = {
 
 export type ProviderSession = EdSession | ParentClient | Skolengo;
 
-export type ProviderSchoolData = Pick<SchoolData, "courses" | "homeworks" | "grades" | "competencies" | "gradesError">;
+export type ProviderSchoolData = Pick<SchoolData, "courses" | "homeworks" | "grades" | "competencies" | "gradesError"> & {
+  studentPhoto?: string;
+};
 
 export type HolidayPeriod = {
   name: string;

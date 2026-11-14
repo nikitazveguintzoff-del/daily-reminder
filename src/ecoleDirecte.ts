@@ -2,6 +2,7 @@ import { Buffer } from "buffer";
 import { inlinePhoto, photoCacheKey } from "./photos";
 import { Client, Require2FA } from "@blockshub/blocksdirecte";
 import { firstCourseDay, lookaheadRange, noonOf, type CourseSlot } from "./courseDay";
+import type { MessageItem } from "./providers/types";
 
 const runtimeGlobal = globalThis as typeof globalThis & { Buffer?: typeof Buffer };
 runtimeGlobal.Buffer ??= Buffer;
@@ -175,14 +176,15 @@ async function request<T>(
   session: EdSession,
   path: string,
   verb: "get" | "post",
-  body: unknown
+  body: unknown,
+  query = ""
 ): Promise<T> {
   const token = session.token;
   const authenticationHeader: Record<string, string> = {};
   if (token) {
     authenticationHeader["X-Token"] = token;
   }
-  const requestUrl = `${API_BASE}${path}?verbe=${verb}&v=${API_VERSION}`;
+  const requestUrl = `${API_BASE}${path}?${query ? `${query}&` : ""}verbe=${verb}&v=${API_VERSION}`;
   const response = await fetchLogged(requestUrl, {
     method: "POST",
     headers: {
@@ -548,6 +550,55 @@ export async function fetchCourseSlots(session: EdSession, student: EdPupil, fro
     { dateDebut: dayKey(from), dateFin: dayKey(to), avecTrous: false }
   );
   return courses.map((course) => ({ start: course.start_date || "", end: course.end_date || "", canceled: !!course.isAnnule }));
+}
+
+type EdMessage = {
+  id?: number | string;
+  subject?: string;
+  date?: string;
+  read?: boolean;
+  from?: { name?: string; civilite?: string; prenom?: string; nom?: string };
+};
+
+function schoolYear(date: Date): string {
+  const start = date.getMonth() >= 7 ? date.getFullYear() : date.getFullYear() - 1;
+  return `${start}-${start + 1}`;
+}
+
+// The mailbox belongs to the logged account (family or student), not to each child.
+export async function fetchMessages(session: EdSession, count: number, now = new Date()): Promise<MessageItem[]> {
+  if (!session.token || !session.student) throw new Error("Aucun compte École Directe connecté.");
+  const owner = session.student.typeCompte === "E" ? "eleves" : "familles";
+  const base = `/v3/${owner}/${session.student.id}/messages`;
+  const body = { anneeMessages: schoolYear(now) };
+  const list = await request<{ messages?: { received?: EdMessage[] } }>(
+    session,
+    `${base}.awp`,
+    "get",
+    body,
+    `force=false&typeRecuperation=received&idClasseur=0&orderBy=date&order=desc&query=&onlyRead=&page=0&itemsPerPage=${count}&getAll=0`
+  );
+  const received = (list.messages?.received || []).slice(0, count);
+  const items: MessageItem[] = [];
+  for (const message of received) {
+    let preview = "";
+    try {
+      const detail = await request<{ content?: string }>(session, `${base}/${message.id}.awp`, "get", body, "mode=destinataire");
+      preview = plainText(decodeBase64(detail.content || ""));
+    } catch (error) {
+      console.warn("[ED] Message content unavailable", { id: message.id, error: error instanceof Error ? error.message : String(error) });
+    }
+    const sender = message.from;
+    items.push({
+      id: String(message.id ?? items.length),
+      subject: message.subject || "(sans objet)",
+      from: sender?.name || [sender?.civilite, sender?.prenom, sender?.nom].filter(Boolean).join(" ") || "École Directe",
+      date: (message.date || "").replace(" ", "T"),
+      read: !!message.read,
+      preview
+    });
+  }
+  return items;
 }
 
 // Without `fixedDay`, shows the first day (today included) that still has a course to come.

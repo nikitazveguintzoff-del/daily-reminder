@@ -1,7 +1,14 @@
-import { fetchCourseSlots, fetchSchoolData, type EdSession, type SchoolData } from "./ecoleDirecte";
-import { fetchPronoteCourseSlots, fetchPronoteData, fetchSkolengoCourseSlots, fetchSkolengoData } from "./providers/schoolServices";
+import { fetchCourseSlots, fetchMessages, fetchSchoolData, type EdSession, type SchoolData } from "./ecoleDirecte";
+import {
+  fetchPronoteCourseSlots,
+  fetchPronoteData,
+  fetchPronoteMessages,
+  fetchSkolengoCourseSlots,
+  fetchSkolengoData,
+  fetchSkolengoMessages
+} from "./providers/schoolServices";
 import { firstCourseDay, lookaheadRange, noonOf, type CourseSlot } from "./courseDay";
-import type { ChildProfile, ProviderAccount, ProviderSchoolData, ProviderSession, ProviderType } from "./providers/types";
+import type { ChildProfile, MessageItem, ProviderAccount, ProviderSchoolData, ProviderSession, ProviderType } from "./providers/types";
 import * as SecureStore from "expo-secure-store";
 import { providerTokenKey } from "./accountStorage";
 
@@ -64,7 +71,8 @@ export async function syncChildren(
   for (const [index, child] of children.entries()) {
     const results: Partial<Record<ProviderType, ProviderSchoolData>> = {};
     const errors: string[] = [];
-    for (const provider of new Set(Object.values(child.sources).filter((value): value is ProviderType => value !== null))) {
+    const dataSources = [child.sources.courses, child.sources.homeworks, child.sources.grades, child.sources.photo];
+    for (const provider of new Set(dataSources.filter((value): value is ProviderType => !!value))) {
       const link = child.links[provider];
       const account = link && accounts.find((item) => item.id === link.accountId && item.provider === provider);
       const session = link && sessions.get(link.accountId);
@@ -115,4 +123,54 @@ export async function syncChildren(
     });
   }
   return combined;
+}
+
+export type ChildMessages = {
+  childId: string;
+  provider: ProviderType | null;
+  accountLabel?: string;
+  messages: MessageItem[];
+  error?: string;
+};
+
+// A mailbox belongs to a parent account: children sharing it trigger a single request.
+export async function syncChildMessages(
+  children: ChildProfile[],
+  accounts: ProviderAccount[],
+  sessions: Map<string, ProviderSession>,
+  count: number,
+  connectionErrors = new Map<string, string>()
+): Promise<ChildMessages[]> {
+  const mailboxes = new Map<string, Promise<MessageItem[]>>();
+  const results: ChildMessages[] = [];
+  for (const child of children) {
+    const provider = child.sources.messages ?? null;
+    if (!provider) {
+      results.push({ childId: child.id, provider, messages: [] });
+      continue;
+    }
+    const link = child.links[provider];
+    const account = link && accounts.find((item) => item.id === link.accountId && item.provider === provider);
+    const session = link && sessions.get(link.accountId);
+    try {
+      if (!link || !account || !session) throw new Error((link && connectionErrors.get(link.accountId)) || `${provider} n'est pas connecté.`);
+      const key = `${provider}:${account.id}`;
+      let mailbox = mailboxes.get(key);
+      if (!mailbox) {
+        const saveToken = tokenSaver(account);
+        mailbox = provider === "ecoleDirecte"
+          ? fetchMessages(session as EdSession, count)
+          : provider === "pronote"
+            ? fetchPronoteMessages(session as Extract<ProviderSession, { children: unknown }>, count, saveToken)
+            : fetchSkolengoMessages(session as Extract<ProviderSession, { GetTimetable: unknown }>, count, saveToken);
+        mailboxes.set(key, mailbox);
+      }
+      results.push({ childId: child.id, provider, accountLabel: account.label, messages: (await mailbox).slice(0, count) });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      console.warn("[SYNC] Messagerie indisponible", { provider, error: message });
+      results.push({ childId: child.id, provider, accountLabel: account?.label, messages: [], error: message });
+    }
+  }
+  return results;
 }

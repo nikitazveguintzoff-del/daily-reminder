@@ -25,6 +25,13 @@ export const fetchSkolengoCourseSlots: typeof Native.fetchSkolengoCourseSlots = 
     account.refreshToken = token;
     await saveToken?.(token);
   });
+export const fetchPronoteMessages: typeof Native.fetchPronoteMessages = (session, count, saveToken) =>
+  rpcWithToken("school.fetchPronoteMessages", [session, count], saveToken);
+export const fetchSkolengoMessages: typeof Native.fetchSkolengoMessages = (account, count, saveToken) =>
+  rpcWithToken("school.fetchSkolengoMessages", [account, count], async (token) => {
+    account.refreshToken = token;
+    await saveToken?.(token);
+  });
 export const fetchSkolengoData: typeof Native.fetchSkolengoData = async (account, studentId, date, days, saveToken) => {
   return rpcWithToken("school.fetchSkolengoData", [account, studentId, date, days], async (token) => {
     account.refreshToken = token;

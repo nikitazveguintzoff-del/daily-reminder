@@ -3,6 +3,7 @@ export type ReminderPreferences = {
   homework: { enabled: boolean; time: string };
   grades: { enabled: boolean; time: string };
   homeworkDays: number;
+  messageCount: number;
   freeze?: { enabled: boolean; startDate: string; endDate: string };
 };
 
@@ -11,6 +12,7 @@ export const defaultPreferences: ReminderPreferences = {
   homework: { enabled: true, time: "17:00" },
   grades: { enabled: true, time: "18:00" },
   homeworkDays: 3,
+  messageCount: 5,
   freeze: { enabled: false, startDate: "", endDate: "" }
 };
 

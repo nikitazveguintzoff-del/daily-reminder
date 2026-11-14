@@ -35,6 +35,7 @@ import {
   GraduationCap,
   House,
   LogOut,
+  Mail,
   Minus,
   Plus,
   RefreshCw,
@@ -46,7 +47,7 @@ import { WebView } from "react-native-webview";
 import { PronoteSsoModal } from "./src/PronoteSsoModal";
 import { PhotoWebViewHost } from "./src/PhotoWebViewHost";
 import { CHILDREN_PROFILES_KEY, PROVIDER_ACCOUNTS_KEY, persistProviderAccounts, providerTokenKey, readProviderAccounts } from "./src/accountStorage";
-import { findFirstCourseDay, syncChildren } from "./src/sync";
+import { findFirstCourseDay, syncChildMessages, syncChildren, type ChildMessages } from "./src/sync";
 import { DevTools } from "./src/DevTools";
 import { forgetPhoto, getCachedPhoto, photoCacheKey } from "./src/photos";
 import "./src/photoStore";
@@ -106,6 +107,7 @@ import type {
   ProviderStudent,
   ProviderType
 } from "./src/providers/types";
+import { withDefaultSources } from "./src/providers/types";
 
 const ACTIVE_CHILD_KEY = "tempo-active-child-id-v2";
 
@@ -119,7 +121,7 @@ if (Platform.OS !== "web") Notifications.setNotificationHandler({
 });
 
 
-type Tab = "journal" | "rappels" | "compte";
+type Tab = "journal" | "messages" | "rappels" | "compte";
 type LoginChallenge = {
   session: EdSession;
   username: string;
@@ -129,6 +131,7 @@ type LoginChallenge = {
 
 const tabItems: { id: Tab; label: string; Icon: typeof House }[] = [
   { id: "journal", label: "Journal", Icon: House },
+  { id: "messages", label: "Messages", Icon: Mail },
   { id: "rappels", label: "Rappels", Icon: Bell },
   { id: "compte", label: "Compte", Icon: UserRound }
 ];
@@ -458,6 +461,60 @@ function ChildProfilesBar({
   );
 }
 
+const PROVIDER_LABELS: Record<ProviderType, string> = {
+  ecoleDirecte: "École Directe",
+  skolengo: "Skolengo",
+  pronote: "Pronote"
+};
+
+function SettingStepper({
+  title,
+  detail,
+  value,
+  min,
+  max,
+  unit,
+  onChange
+}: {
+  title: string;
+  detail: string;
+  value: number;
+  min: number;
+  max: number;
+  unit: string;
+  onChange: (value: number) => void;
+}) {
+  return (
+    <View style={styles.settingsToggleRow}>
+      <View style={styles.rowContent}>
+        <Text style={styles.rowTitle}>{title}</Text>
+        <Text style={styles.rowDetail}>{detail}</Text>
+      </View>
+      <View style={styles.stepper}>
+        <Pressable
+          accessibilityRole="button"
+          accessibilityLabel={`Réduire : ${title}`}
+          disabled={value <= min}
+          onPress={() => onChange(Math.max(min, value - 1))}
+          style={styles.stepButton}
+        >
+          <Minus size={16} color={value <= min ? palette.muted : palette.ink} />
+        </Pressable>
+        <Text accessibilityLabel={`${value} ${unit}`} style={styles.stepValue}>{value}</Text>
+        <Pressable
+          accessibilityRole="button"
+          accessibilityLabel={`Augmenter : ${title}`}
+          disabled={value >= max}
+          onPress={() => onChange(Math.min(max, value + 1))}
+          style={styles.stepButton}
+        >
+          <Plus size={16} color={value >= max ? palette.muted : palette.ink} />
+        </Pressable>
+      </View>
+    </View>
+  );
+}
+
 function ProviderSourceSelector({
   child,
   accounts,
@@ -471,13 +528,9 @@ function ProviderSourceSelector({
     { id: "courses", label: "Emploi du temps" },
     { id: "homeworks", label: "Devoirs" },
     { id: "grades", label: "Notes" },
-    { id: "photo", label: "Photo de profil" }
+    { id: "photo", label: "Photo de profil" },
+    { id: "messages", label: "Messagerie" }
   ];
-  const providerLabels: Record<ProviderType, string> = {
-    ecoleDirecte: "École Directe",
-    skolengo: "Skolengo",
-    pronote: "Pronote"
-  };
   const availableProviders = (Object.keys(child.links) as ProviderType[]).filter((provider) => {
     const link = child.links[provider];
     return !!link && accounts.some((account) => account.id === link.accountId);
@@ -491,7 +544,7 @@ function ProviderSourceSelector({
           <View style={styles.domainChoiceRow}>
               {[...availableProviders, null].map((provider) => {
                 const selected = child.sources[id] === provider;
-                const providerLabel = provider ? providerLabels[provider] : "Désactivé";
+                const providerLabel = provider ? PROVIDER_LABELS[provider] : "Désactivé";
                 return (
                   <Pressable
                     key={provider}
@@ -554,6 +607,10 @@ function AppContent() {
   const [selectedHomework, setSelectedHomework] = useState<{ student: EdPupil; homework: HomeworkItem } | null>(null);
   const [schoolZone, setSchoolZone] = useState<SchoolZone>("C");
   const [holidaysOpen, setHolidaysOpen] = useState(false);
+  const [messagesByChild, setMessagesByChild] = useState<ChildMessages[] | null>(null);
+  const [messagesBusy, setMessagesBusy] = useState(false);
+  const [messagesSyncedAt, setMessagesSyncedAt] = useState<string | null>(null);
+  const [expandedMessage, setExpandedMessage] = useState<string | null>(null);
 
   useEffect(() => {
     void getSavedZone().then(setSchoolZone);
@@ -618,7 +675,8 @@ function AppContent() {
         courses: existing?.sources?.courses ?? provider,
         homeworks: existing?.sources?.homeworks ?? provider,
         grades: existing?.sources?.grades ?? provider,
-        photo: existing?.sources?.photo ?? provider
+        photo: existing?.sources?.photo ?? provider,
+        messages: existing?.sources?.messages ?? provider
       };
       for (const domain of Object.keys(sources) as DomainType[]) {
         const source = sources[domain];
@@ -683,6 +741,7 @@ function AppContent() {
       account.students
     );
     providerSessionsRef.current.set(account.id, session);
+    setMessagesByChild(null);
     for (const replacedAccount of replacedAccounts) {
       providerSessionsRef.current.delete(replacedAccount.id);
       await SecureStore.deleteItemAsync(providerTokenKey(replacedAccount.id));
@@ -714,6 +773,8 @@ function AppContent() {
     setChildrenProfiles(nextChildren);
     childrenProfilesRef.current = nextChildren;
     await SecureStore.setItemAsync(CHILDREN_PROFILES_KEY, JSON.stringify(nextChildren));
+    setMessagesByChild(null);
+    if (domain === "messages") return;
     const nextData = await fetchConnectedChildrenData(nextChildren, selectedDayRef.current);
     setData(nextData);
     selectActiveChild(null);
@@ -740,6 +801,7 @@ function AppContent() {
     childrenProfilesRef.current = nextChildren;
     setProviderAccounts(nextAccounts);
     setChildrenProfiles(nextChildren);
+    setMessagesByChild(null);
     if (account.provider === "ecoleDirecte" && account.username === username) {
       sessionRef.current = null;
       setData(null);
@@ -785,12 +847,8 @@ function AppContent() {
     }, session, remember);
   };
 
-  // Without a date, the sync shows the first day (today included) that still has a course to come.
-  const fetchConnectedChildrenData = async (
-    childrenToFetch = childrenProfiles,
-    timetableDate?: Date,
-    homeworkDays = preferencesRef.current.homeworkDays
-  ): Promise<SchoolData[]> => {
+  // Picks up tokens rotated elsewhere (background task) and reopens dropped Pronote/Skolengo sessions.
+  const renewProviderSessions = async (): Promise<Map<string, string>> => {
     const connectionErrors = new Map<string, string>();
     for (const saved of await readProviderAccounts()) {
       const current = providerAccountsRef.current.find((account) => account.id === saved.id);
@@ -815,6 +873,16 @@ function AppContent() {
         connectionErrors.set(saved.id, error instanceof Error ? error.message : String(error));
       }
     }
+    return connectionErrors;
+  };
+
+  // Without a date, the sync shows the first day (today included) that still has a course to come.
+  const fetchConnectedChildrenData = async (
+    childrenToFetch = childrenProfiles,
+    timetableDate?: Date,
+    homeworkDays = preferencesRef.current.homeworkDays
+  ): Promise<SchoolData[]> => {
+    const connectionErrors = await renewProviderSessions();
     let day = timetableDate;
     if (!day) {
       day = await findFirstCourseDay(childrenToFetch, providerAccountsRef.current, providerSessionsRef.current);
@@ -846,7 +914,7 @@ function AppContent() {
       let restoredChildren: ChildProfile[] = [];
       if (savedChildren) {
         try {
-          restoredChildren = JSON.parse(savedChildren) as ChildProfile[];
+          restoredChildren = (JSON.parse(savedChildren) as ChildProfile[]).map(withDefaultSources);
         } catch {}
       }
       let restoredAccounts: ProviderAccount[] = [];
@@ -1362,6 +1430,62 @@ function AppContent() {
     }
   };
 
+  const loadMessages = async (count = preferencesRef.current.messageCount) => {
+    if (!childrenProfilesRef.current.length) return;
+    setMessagesBusy(true);
+    try {
+      const connectionErrors = await renewProviderSessions();
+      const result = await syncChildMessages(
+        childrenProfilesRef.current,
+        providerAccountsRef.current,
+        providerSessionsRef.current,
+        count,
+        connectionErrors
+      );
+      setMessagesByChild(result);
+      setMessagesSyncedAt(new Date().toISOString());
+    } catch (error) {
+      setNotice(`Messagerie indisponible : ${error instanceof Error ? error.message : String(error)}`);
+      setMessagesByChild([]);
+    } finally {
+      setMessagesBusy(false);
+    }
+  };
+
+  useEffect(() => {
+    if (tab === "messages" && messagesByChild === null && !messagesBusy && childrenProfiles.length) void loadMessages();
+  }, [tab, messagesByChild, messagesBusy, childrenProfiles.length]);
+
+  const refreshRef = useRef<(timetableDate?: Date) => Promise<void>>(async () => undefined);
+  const homeworkRefreshTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  useEffect(() => () => {
+    if (homeworkRefreshTimer.current) clearTimeout(homeworkRefreshTimer.current);
+  }, []);
+
+  // Only this setting is written: unsaved reminder times edited in Rappels must stay unsaved.
+  const updateDisplaySetting = async (key: "homeworkDays" | "messageCount", value: number) => {
+    if (preferencesRef.current[key] === value) return;
+    const next = { ...preferencesRef.current, [key]: value };
+    preferencesRef.current = next;
+    setPreferences(next);
+    let stored: ReminderPreferences = defaultPreferences;
+    try {
+      const saved = await SecureStore.getItemAsync(PREFS_KEY);
+      if (saved) stored = { ...defaultPreferences, ...JSON.parse(saved) };
+    } catch {}
+    await SecureStore.setItemAsync(PREFS_KEY, JSON.stringify({ ...stored, [key]: value }));
+    if (key === "messageCount") {
+      setMessagesByChild(null);
+      return;
+    }
+    // Steppers are tapped repeatedly: resync the journal once the value settles.
+    if (homeworkRefreshTimer.current) clearTimeout(homeworkRefreshTimer.current);
+    homeworkRefreshTimer.current = setTimeout(() => {
+      homeworkRefreshTimer.current = null;
+      if (dataRef.current) void refreshRef.current(selectedDayRef.current);
+    }, 1200);
+  };
+
   // Without a date (sync button, resume), jump to the first day that still has a course to come.
   const refresh = async (timetableDate?: Date) => {
     console.log("[APP] Refreshing data...");
@@ -1462,6 +1586,8 @@ function AppContent() {
       setBusy(false);
     }
   };
+
+  refreshRef.current = refresh;
 
   const navigateSchedule = async (offset: number) => {
     const nextDay = new Date(selectedDay);
@@ -2176,29 +2302,6 @@ function AppContent() {
         onTime={(time) => updateReminder("homework", { time })}
         onEnabled={(enabled) => updateReminder("homework", { enabled })}
       />
-      <View style={styles.horizonRow}>
-        <View style={styles.rowContent}>
-          <Text style={styles.rowTitle}>Période des devoirs</Text>
-          <Text style={styles.rowDetail}>Nombre de jours à afficher</Text>
-        </View>
-        <View style={styles.stepper}>
-          <Pressable
-            accessibilityLabel="Réduire la période"
-            onPress={() => setPreferences((current) => ({ ...current, homeworkDays: Math.max(1, current.homeworkDays - 1) }))}
-            style={styles.stepButton}
-          >
-            <Minus size={16} color={palette.ink} />
-          </Pressable>
-          <Text style={styles.stepValue}>{preferences.homeworkDays}</Text>
-          <Pressable
-            accessibilityLabel="Augmenter la période"
-            onPress={() => setPreferences((current) => ({ ...current, homeworkDays: Math.min(14, current.homeworkDays + 1) }))}
-            style={styles.stepButton}
-          >
-            <Plus size={16} color={palette.ink} />
-          </Pressable>
-        </View>
-      </View>
       <ReminderRow
         title="Dernières notes"
         detail="Quand une note est disponible"
@@ -2229,6 +2332,94 @@ function AppContent() {
     </>
   );
 
+  const renderMessages = () => {
+    const visibleChildren = activeChildId
+      ? childrenProfiles.filter((child) => child.id === activeChildId)
+      : childrenProfiles;
+    const mailboxSize = new Map<string, number>();
+    for (const entry of messagesByChild || []) {
+      const child = childrenProfiles.find((item) => item.id === entry.childId);
+      const accountId = entry.provider ? child?.links[entry.provider]?.accountId : undefined;
+      if (accountId) mailboxSize.set(accountId, (mailboxSize.get(accountId) || 0) + 1);
+    }
+    return (
+      <>
+        <View style={styles.sectionHeading}>
+          <Text style={styles.sectionTitle}>Messages reçus</Text>
+          <View style={styles.dayNavigation}>
+            <Text style={styles.sectionMeta}>{preferences.messageCount} dernier{preferences.messageCount === 1 ? "" : "s"}</Text>
+            <Pressable
+              accessibilityRole="button"
+              accessibilityLabel="Actualiser la messagerie"
+              onPress={() => void loadMessages()}
+              disabled={messagesBusy}
+              style={styles.iconButton}
+            >
+              {messagesBusy ? <ActivityIndicator color={palette.green} /> : <RefreshCw size={16} color={palette.green} />}
+            </Pressable>
+          </View>
+        </View>
+        <View style={styles.listSection}>
+          {!childrenProfiles.length && <EmptyLine>Connecte un compte pour retrouver la messagerie.</EmptyLine>}
+          {visibleChildren.map((child, index) => {
+            const entry = messagesByChild?.find((item) => item.childId === child.id);
+            const provider = child.sources.messages ?? null;
+            const accountId = provider ? child.links[provider]?.accountId : undefined;
+            const shared = !!accountId && (mailboxSize.get(accountId) || 0) > 1;
+            const pupil: EdPupil = {
+              id: index + 1,
+              prenom: child.firstName,
+              nom: child.lastName,
+              photo: childProfilePhoto(child, providerAccounts),
+              classe: { libelle: child.className }
+            };
+            const detail = provider
+              ? `${PROVIDER_LABELS[provider]}${shared ? " · boîte partagée" : ""}`
+              : "Messagerie désactivée";
+            return (
+              <View key={child.id} style={styles.pupilGroup}>
+                <PupilHeading pupil={pupil} detail={detail} />
+                {!provider ? <EmptyLine>Choisis une source « Messagerie » pour cet enfant dans Compte.</EmptyLine>
+                  : !entry ? <EmptyLine>{messagesBusy ? "Chargement des messages…" : "Actualise pour charger les messages."}</EmptyLine>
+                  : entry.error ? <EmptyLine>{`${PROVIDER_LABELS[provider]} : ${entry.error}`}</EmptyLine>
+                  : entry.messages.length === 0 ? <EmptyLine>Aucun message reçu.</EmptyLine>
+                  : entry.messages.map((message) => {
+                    const key = `${child.id}:${message.id}`;
+                    const expanded = expandedMessage === key;
+                    return (
+                      <Pressable
+                        key={key}
+                        accessibilityRole="button"
+                        accessibilityState={{ expanded }}
+                        accessibilityLabel={`${message.read ? "" : "Non lu, "}${message.subject}, de ${message.from}`}
+                        onPress={() => setExpandedMessage(expanded ? null : key)}
+                        style={styles.homeworkRow}
+                      >
+                        <View style={[styles.homeworkMark, message.read ? styles.messageReadMark : styles.homeworkTodoMark]} />
+                        <View style={styles.rowContent}>
+                          <Text style={[styles.rowTitle, !message.read && styles.newGradeTitle]} numberOfLines={expanded ? undefined : 1}>{message.subject}</Text>
+                          <Text style={styles.messageSender} numberOfLines={1}>{message.from}</Text>
+                          {!!message.preview && (
+                            <Text style={styles.rowDetail} numberOfLines={expanded ? undefined : 2}>{message.preview}</Text>
+                          )}
+                        </View>
+                        <Text style={styles.dueDate}>{message.date ? shortDate(message.date) : ""}</Text>
+                      </Pressable>
+                    );
+                  })}
+              </View>
+            );
+          })}
+        </View>
+        {messagesSyncedAt && (
+          <Text style={styles.syncCaption}>
+            Messagerie relevée à {new Date(messagesSyncedAt).toLocaleTimeString("fr-FR", { hour: "2-digit", minute: "2-digit" })}
+          </Text>
+        )}
+      </>
+    );
+  };
+
   const renderAccount = () => (
     <>
       <View style={styles.pageIntro}>
@@ -2253,6 +2444,26 @@ function AppContent() {
           </Pressable>
           {accountSettingsOpen && (
             <View style={styles.settingsPanel}>
+              <Text style={styles.settingsGroupTitle}>Affichage</Text>
+              <SettingStepper
+                title="Période des devoirs"
+                detail="Nombre de jours de devoirs affichés dans le journal"
+                value={preferences.homeworkDays}
+                min={1}
+                max={14}
+                unit="jours"
+                onChange={(value) => void updateDisplaySetting("homeworkDays", value)}
+              />
+              <SettingStepper
+                title="Messages affichés"
+                detail="Nombre de derniers messages reçus par enfant"
+                value={preferences.messageCount}
+                min={1}
+                max={20}
+                unit="messages"
+                onChange={(value) => void updateDisplaySetting("messageCount", value)}
+              />
+              <Text style={styles.settingsGroupTitle}>Synchronisation</Text>
               <View style={styles.settingsToggleRow}>
                 <View style={styles.rowContent}>
                   <Text style={styles.rowTitle}>Synchronisation périodique</Text>
@@ -2347,6 +2558,17 @@ function AppContent() {
       </View>
 
       {tab === "journal" && renderJournalBar()}
+      {tab === "messages" && childrenProfiles.length > 0 && (
+        <View style={styles.journalBar}>
+          <ChildProfilesBar
+            children={childrenProfiles}
+            providerAccounts={providerAccounts}
+            activeChildId={activeChildId}
+            onSelectChild={selectActiveChild}
+            onAddChild={() => setTab("compte")}
+          />
+        </View>
+      )}
       <ScrollView
         ref={contentScrollRef}
         keyboardShouldPersistTaps="handled"
@@ -2356,9 +2578,10 @@ function AppContent() {
         <DevTools />
         {!!notice && <Text accessibilityRole="alert" style={styles.notice}>{notice}</Text>}
         {tab === "journal" && renderJournal()}
+        {tab === "messages" && renderMessages()}
         {tab === "rappels" && renderReminders()}
         {tab === "compte" && renderAccount()}
-        {data?.length ? <Text style={styles.syncCaption}>Dernière synchro {new Date(data[0].syncedAt).toLocaleTimeString("fr-FR", { hour: "2-digit", minute: "2-digit" })}</Text> : null}
+        {tab !== "messages" && data?.length ? <Text style={styles.syncCaption}>Dernière synchro {new Date(data[0].syncedAt).toLocaleTimeString("fr-FR", { hour: "2-digit", minute: "2-digit" })}</Text> : null}
       </ScrollView>
 
       <Modal
@@ -2602,7 +2825,6 @@ const styles = StyleSheet.create({
   reminderRow: { minHeight: 84, flexDirection: "row", alignItems: "center", gap: 9, borderBottomWidth: 1, borderColor: palette.line, backgroundColor: "#FFFFFF", paddingHorizontal: 12, marginBottom: 1 },
   reminderAccent: { width: 4, height: 39, borderRadius: 2, marginRight: 2 },
   timeInput: { minWidth: 57, color: palette.ink, fontSize: 14, fontWeight: "700", textAlign: "center", backgroundColor: palette.background, borderRadius: 8, paddingHorizontal: 5, paddingVertical: 8 },
-  horizonRow: { minHeight: 75, flexDirection: "row", alignItems: "center", backgroundColor: "#FFFFFF", borderBottomWidth: 1, borderColor: palette.line, paddingHorizontal: 14 },
   pauseCard: { backgroundColor: "#FFFFFF", borderRadius: 12, borderWidth: 1, borderColor: palette.line, paddingHorizontal: 14, paddingVertical: 8, marginTop: 17 },
   pauseDates: { flexDirection: "row", gap: 12, paddingBottom: 10 },
   pauseDateField: { flex: 1 },
@@ -2622,6 +2844,9 @@ const styles = StyleSheet.create({
   settingsMenu: { marginTop: 12, borderWidth: 1, borderColor: palette.line, backgroundColor: "#FFFFFF" },
   settingsMenuHeader: { minHeight: 48, flexDirection: "row", alignItems: "center", gap: 10, paddingHorizontal: 14 },
   settingsMenuTitle: { flex: 1, color: palette.ink, fontSize: 13, fontWeight: "700" },
+  settingsGroupTitle: { color: palette.muted, fontSize: 10, fontWeight: "800", letterSpacing: 0.5, textTransform: "uppercase", marginTop: 14 },
+  messageReadMark: { backgroundColor: palette.line },
+  messageSender: { color: palette.ink, fontSize: 11, marginTop: 2 },
   settingsPanel: { paddingHorizontal: 14, paddingBottom: 14, borderTopWidth: 1, borderTopColor: palette.line },
   settingsToggleRow: { minHeight: 68, flexDirection: "row", alignItems: "center", gap: 10 },
   settingsHint: { color: palette.coral, fontSize: 11, lineHeight: 16, marginBottom: 8 },

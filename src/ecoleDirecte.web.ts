@@ -28,6 +28,7 @@ export const fetchLoginChallenge: typeof Native.fetchLoginChallenge = (session) 
 export const resolveLoginChallenge: typeof Native.resolveLoginChallenge = (session, answer) => call("resolveLoginChallenge", session, [answer]);
 export const fetchSchoolData: typeof Native.fetchSchoolData = (session, ...args) => call("fetchSchoolData", session, args);
 export const fetchCourseSlots: typeof Native.fetchCourseSlots = (session, ...args) => call("fetchCourseSlots", session, args);
+export const fetchMessages: typeof Native.fetchMessages = (session, ...args) => call("fetchMessages", session, args);
 export const fetchStudentsSchoolDataWithAutoAdvance: typeof Native.fetchStudentsSchoolDataWithAutoAdvance = async (session, ...args) => {
   const result = await call<Awaited<ReturnType<typeof Native.fetchStudentsSchoolDataWithAutoAdvance>>>("fetchStudentsSchoolDataWithAutoAdvance", session, args);
   return { ...result, selectedDay: new Date(result.selectedDay) };

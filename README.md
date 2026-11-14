@@ -45,6 +45,8 @@ npm run test:web   # construit et démarre un service de test sur le port 8799
 - Connexion Pronote via l’ENT dans une WebView (EduConnect, FranceConnect, SSO…) avec le jeton d’application Pronote (comme l’app officielle) : aucun mot de passe n’est saisi ni stocké. Le jeton est à usage unique et renouvelé à chaque connexion. Pause automatique après un échec pour éviter un blocage d’IP.
 - Connexion École Directe avec prise en charge de la double authentification.
 - Emploi du temps du jour, devoirs sur une période de 1 à 14 jours et dernière note connue.
+- Onglet **Messages** : les derniers messages reçus (1 à 20) pour chaque enfant, depuis le service choisi comme source « Messagerie » (École Directe, Skolengo ou Pronote). La boîte appartient au compte parent : les enfants qui partagent un même compte affichent les mêmes messages, récupérés une seule fois.
+- Dans **Compte > Paramètres > Affichage** : période des devoirs et nombre de messages affichés, enregistrés immédiatement.
 - Horaires configurables pour les rappels de cours, devoirs et notes.
 - Option pour mémoriser les jetons de connexion dans le stockage sécurisé du téléphone.
 
@@ -54,7 +56,7 @@ Les connexions utilisent les API non officielles des trois services via leurs cl
 
 Sur mobile, les jetons mémorisés sont stockés avec `expo-secure-store` et utilisés directement par l'application ; aucun serveur Tempo distant ne les reçoit. La connexion Pronote mémorise son jeton d'application, pas le mot de passe de l'ENT. La version web conserve ses jetons dans le stockage chiffré du service local décrit ci-dessus.
 
-La synchronisation périodique Android couvre désormais les comptes École Directe, Skolengo et Pronote enregistrés, tous leurs profils enfants et les sources choisies pour chaque domaine (cours, devoirs, notes, photo). L'interface conserve sa limite actuelle d'un compte par fournisseur ; cela ne signifie pas un nombre illimité de comptes d'un même fournisseur. Les mêmes règles d'assemblage sont utilisées au premier plan et en arrière-plan.
+La synchronisation périodique Android couvre désormais les comptes École Directe, Skolengo et Pronote enregistrés, tous leurs profils enfants et les sources choisies pour chaque domaine (cours, devoirs, notes, photo). La messagerie n'est relevée qu'à l'ouverture de l'onglet Messages ou via son bouton d'actualisation, pas en arrière-plan. L'interface conserve sa limite actuelle d'un compte par fournisseur ; cela ne signifie pas un nombre illimité de comptes d'un même fournisseur. Les mêmes règles d'assemblage sont utilisées au premier plan et en arrière-plan.
 
 Dans **Compte > Paramètres**, activer la synchronisation après avoir mémorisé les jetons de tous les comptes. Une connexion échouée n'empêche pas de tenter les autres comptes ; une source manquante ou en erreur rend le résultat incomplet et bloque l'envoi des rappels issus de cette exécution. Le diagnostic indique la dernière erreur. Les jetons renouvelés sont sauvegardés, notamment celui de Pronote avant le téléchargement des photos. Les photos Pronote sont téléchargées avec la session authentifiée, vérifiées par leur signature binaire et mises en cache pour la session.
 

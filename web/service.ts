@@ -80,14 +80,19 @@ function skolengoResult(result: Awaited<ReturnType<typeof school.restoreSkolengo
   remember(response.account.remoteId, account.refreshToken, response);
   return response;
 }
-async function dataWithToken<T>(remoteId: string, run: (save: (token: string) => Promise<void>) => Promise<T>): Promise<TokenResponse<T>> {
+async function dataWithToken<T>(
+  remoteId: string,
+  run: (save: (token: string) => Promise<void>) => Promise<T>,
+  keepSessionOnError = false
+): Promise<TokenResponse<T>> {
   let refreshToken: string | undefined;
   try {
     const data = await run(async (token) => { refreshToken = token; rotate(remoteId, token); });
     return { data, refreshToken };
   } catch (error) {
-    // A failing session must not be handed back on the next reload.
-    forget(remoteId);
+    // A failing session must not be handed back on the next reload; an optional feature
+    // (messaging disabled by the school) is no reason to log the session in again.
+    if (!keepSessionOnError) forget(remoteId);
     return { error: error instanceof Error ? error.message : String(error), refreshToken };
   }
 }
@@ -184,6 +189,7 @@ export async function dispatch(method: string, args: unknown[]): Promise<unknown
           case "resolveLoginChallenge": value = await ed.resolveLoginChallenge(session, values[0] as string); break;
           case "fetchSchoolData": value = await ed.fetchSchoolData(session, values[0] as number, values[1] as ed.EdPupil, new Date(values[2] as string)); break;
           case "fetchCourseSlots": value = await ed.fetchCourseSlots(session, values[0] as ed.EdPupil, new Date(values[1] as string), new Date(values[2] as string)); break;
+          case "fetchMessages": value = await ed.fetchMessages(session, values[0] as number, values[1] ? new Date(values[1] as string) : undefined); break;
           case "fetchStudentsSchoolDataWithAutoAdvance": value = await ed.fetchStudentsSchoolDataWithAutoAdvance(session, values[0] as number, values[1] ? new Date(values[1] as string) : undefined); break;
           default: throw new Error("Opération École Directe inconnue.");
         }
@@ -235,6 +241,16 @@ export async function dispatch(method: string, args: unknown[]): Promise<unknown
       const reference = args[0] as { remoteId: string };
       const account = read<Awaited<ReturnType<typeof school.restoreSkolengoLogin>>["account"]>(reference);
       return dataWithToken(reference.remoteId, (save) => school.fetchSkolengoCourseSlots(account, args[1] as string, new Date(args[2] as string), new Date(args[3] as string), save));
+    }
+    case "school.fetchPronoteMessages": {
+      const reference = args[0] as { remoteId: string };
+      const session = read<school.PronoteConnection["session"]>(reference);
+      return dataWithToken(reference.remoteId, (save) => school.fetchPronoteMessages(session, args[1] as number, save), true);
+    }
+    case "school.fetchSkolengoMessages": {
+      const reference = args[0] as { remoteId: string };
+      const account = read<Awaited<ReturnType<typeof school.restoreSkolengoLogin>>["account"]>(reference);
+      return dataWithToken(reference.remoteId, (save) => school.fetchSkolengoMessages(account, args[1] as number, save), true);
     }
     case "auth.cancel": await authContext?.close(); return null;
     case "auth.skolengo": return authenticate(async (context) => {

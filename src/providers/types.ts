@@ -3,7 +3,17 @@ import type { ParentClient } from "pronotets";
 import type { School, Skolengo } from "skolengojs";
 
 export type ProviderType = "ecoleDirecte" | "skolengo" | "pronote";
-export type DomainType = "courses" | "homeworks" | "grades" | "photo";
+export type DomainType = "courses" | "homeworks" | "grades" | "photo" | "messages";
+export const DOMAIN_TYPES: DomainType[] = ["courses", "homeworks", "grades", "photo", "messages"];
+
+export type MessageItem = {
+  id: string;
+  subject: string;
+  from: string;
+  date: string;
+  read: boolean;
+  preview: string;
+};
 
 export type ProviderStudent = {
   id: string;
@@ -26,6 +36,16 @@ export type ChildProfile = {
   links: Partial<Record<ProviderType, ProviderStudentLink>>;
   sources: Record<DomainType, ProviderType | null>;
 };
+
+// Profiles saved before 1.4.0 have no messages source: default it to an already linked service.
+export function withDefaultSources(child: ChildProfile): ChildProfile {
+  const sources: Partial<Record<DomainType, ProviderType | null>> = child.sources || {};
+  if (sources.messages !== undefined) return child;
+  const linked = Object.keys(child.links || {}) as ProviderType[];
+  const preferred = sources.homeworks ?? sources.courses ?? null;
+  const messages = preferred && child.links[preferred] ? preferred : linked[0] ?? null;
+  return { ...child, sources: { courses: null, homeworks: null, grades: null, photo: null, ...sources, messages } };
+}
 
 export type ProviderAccount = {
   id: string;

@@ -26,11 +26,14 @@ const edMock = `export const fetchSchoolData = (...args) => fixture.ed(...args);
 export const createEdSession = () => ({ pupils: [{id:1}] });
 export const relogin = async () => { fixture.restored.push("ecoleDirecte"); };
 export const fetchStudentsSchoolDataWithAutoAdvance = () => { throw Error("Unexpected legacy sync"); };
-export const fetchCourseSlots = async (...args) => (fixture.slots?.ecoleDirecte ?? (() => []))(...args);`;
+export const fetchCourseSlots = async (...args) => (fixture.slots?.ecoleDirecte ?? (() => []))(...args);
+export const fetchMessages = async (...args) => fixture.messages.ecoleDirecte(...args);`;
 const servicesMock = `export const fetchPronoteData = (...args) => fixture.pronote(...args);
 export const fetchSkolengoData = (...args) => fixture.skolengo(...args);
 export const fetchPronoteCourseSlots = async (...args) => (fixture.slots?.pronote ?? (() => []))(...args);
 export const fetchSkolengoCourseSlots = async (...args) => (fixture.slots?.skolengo ?? (() => []))(...args);
+export const fetchPronoteMessages = async (...args) => fixture.messages.pronote(...args);
+export const fetchSkolengoMessages = async (...args) => fixture.messages.skolengo(...args);
 export const restorePronote = async (token, save) => {
 fixture.restored.push("pronote"); await save("renewed-pronote"); return { session: {}, refreshToken: "renewed-pronote" }; };
 export const restoreSkolengoLogin = async () => {
@@ -136,6 +139,37 @@ test("missing sessions are reported, disabled domains stay empty", async () => {
   assert.match(entry.error, /pronote/);
   assert.deepEqual(entry.grades, []);
 });
+test("messages are fetched once per mailbox, follow each child's source and never join the data sync", async () => {
+  const context = fixture();
+  const calls = [];
+  const mail = (provider) => async (_session, count) => {
+    calls.push(`${provider}:${count}`);
+    if (provider === "skolengo") throw Error("Messagerie fermée");
+    return Array.from({ length: 4 }, (_, index) => ({ id: `${provider}${index}`, subject: provider, from: "Prof", date: "", read: false, preview: "" }));
+  };
+  context.messages = { ecoleDirecte: mail("ecoleDirecte"), pronote: mail("pronote"), skolengo: mail("skolengo") };
+  const { syncChildMessages, syncChildren } = await load("src\\sync.ts", context, mocks);
+  const sessions = new Map([["ed", { pupils: [{ id: 1 }] }], ["pn", {}], ["sk", {}]]);
+  const withMessages = (id, messages) => ({ ...child(id), sources: { ...child(id).sources, messages } });
+  const result = await syncChildMessages(
+    [withMessages("one", "pronote"), withMessages("two", "pronote"), withMessages("three", "skolengo"), withMessages("four", null)],
+    accounts, sessions, 2
+  );
+  assert.deepEqual(calls, ["pronote:2", "skolengo:2"]);
+  assert.deepEqual(result.map(({ childId, messages, error }) => [childId, messages.length, error]), [
+    ["one", 2, undefined], ["two", 2, undefined], ["three", 0, "Messagerie fermée"], ["four", 0, undefined]
+  ]);
+  const onlyEd = { ...child("solo"), sources: { courses: "ecoleDirecte", homeworks: "ecoleDirecte", grades: "ecoleDirecte", photo: "ecoleDirecte", messages: "skolengo" } };
+  context.skolengo = async () => { throw Error("Unexpected Skolengo data sync"); };
+  const [synced] = await syncChildren([onlyEd], accounts, sessions, new Date(), 3);
+  assert.equal(synced.error, undefined);
+
+  const { withDefaultSources } = await load("src\\providers\\types.ts", {}, {});
+  const legacy = { ...child("old"), sources: { courses: "skolengo", homeworks: "pronote", grades: null, photo: null } };
+  assert.equal(withDefaultSources(legacy).sources.messages, "pronote");
+  assert.equal(withDefaultSources({ ...legacy, sources: { ...legacy.sources, messages: null } }).sources.messages, null);
+});
+
 test("Android task restores all three providers and saves rotated tokens", async () => {
   const context = fixture();
   context.store.set("tempo-background-sync-enabled", "true");

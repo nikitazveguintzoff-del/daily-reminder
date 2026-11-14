@@ -14,7 +14,7 @@ import {
 import { pronoteBaseUrl, pronoteLog, type PronoteSsoCapture } from "./pronoteSso";
 import type { CourseSlot } from "../courseDay";
 import type { CourseItem, GradeItem, HomeworkItem } from "../ecoleDirecte";
-import type { ProviderSchoolData, ProviderStudent } from "./types";
+import type { MessageItem, ProviderSchoolData, ProviderStudent } from "./types";
 
 const runtimeGlobal = globalThis as typeof globalThis & { Buffer?: typeof Buffer };
 runtimeGlobal.Buffer ??= Buffer;
@@ -697,16 +697,57 @@ export function fetchPronoteData(
 ): Promise<ProviderSchoolData> {
   const run = pronoteDataQueue.then(async () => {
     try { return await fetchPronoteDataNow(session, studentId, timetableDate, homeworkDays); }
-    finally {
-      if (saveToken) {
-        const credentials = session.exportCredentials();
-        const url = pronoteBaseUrl(session.pronoteUrl);
-        if (!url) throw new Error("Adresse de la session Pronote invalide.");
-        await saveToken(JSON.stringify({
-          v: 4, url, username: credentials.username, token: credentials.password, uuid: credentials.uuid
-        } satisfies PronoteSnapshot));
+    finally { await savePronoteToken(session, saveToken); }
+  });
+  pronoteDataQueue = run.catch(() => undefined);
+  return run;
+}
+
+async function savePronoteToken(session: ParentClient, saveToken?: (token: string) => Promise<void>): Promise<void> {
+  if (!saveToken) return;
+  const credentials = session.exportCredentials();
+  const url = pronoteBaseUrl(session.pronoteUrl);
+  if (!url) throw new Error("Adresse de la session Pronote invalide.");
+  await saveToken(JSON.stringify({
+    v: 4, url, username: credentials.username, token: credentials.password, uuid: credentials.uuid
+  } satisfies PronoteSnapshot));
+}
+
+function messagePreview(content: string): string {
+  const entities: Record<string, string> = { nbsp: " ", amp: "&", lt: "<", gt: ">", quot: '"', apos: "'", "#39": "'" };
+  return homeworkPreview(content.replace(/<br\s*\/?>|<\/p>/gi, " "))
+    .replace(/&(nbsp|amp|lt|gt|quot|apos|#39);/gi, (_match, name: string) => entities[name.toLowerCase()]);
+}
+
+const byDateDesc = (first: MessageItem, second: MessageItem) =>
+  (new Date(second.date).getTime() || 0) - (new Date(first.date).getTime() || 0);
+
+// Pronote lists discussions newest first; each one is summarised by its latest message.
+export function fetchPronoteMessages(
+  session: ParentClient,
+  count: number,
+  saveToken?: (token: string) => Promise<void>
+): Promise<MessageItem[]> {
+  const run = pronoteDataQueue.then(async () => {
+    try {
+      const discussions = (await session.discussions())
+        .filter((discussion) => !discussion.labels.includes("Drafts") && !discussion.labels.includes("Trash"))
+        .slice(0, count);
+      const items: MessageItem[] = [];
+      for (const discussion of discussions) {
+        const messages = await discussion.messages();
+        const latest = messages[messages.length - 1];
+        items.push({
+          id: discussion.id,
+          subject: discussion.subject || "(sans objet)",
+          from: latest?.author || discussion.creator || "Pronote",
+          date: latest ? toLocalDateTime(latest.created) : "",
+          read: discussion.unread === 0,
+          preview: messagePreview(latest?.content || "")
+        });
       }
-    }
+      return items.sort(byDateDesc);
+    } finally { await savePronoteToken(session, saveToken); }
   });
   pronoteDataQueue = run.catch(() => undefined);
   return run;
@@ -944,6 +985,31 @@ export function fetchSkolengoCourseSlots(
     const { student, request } = await skolengoStudent(account, studentId, saveToken);
     const agenda = await request(() => fetchSkolengoAgenda(student, studentId, from, to));
     return agenda.courses.map(({ start, end, canceled }) => ({ start, end, canceled }));
+  });
+  skolengoDataQueues.set(account, run.catch(() => undefined));
+  return run;
+}
+
+// Skolengo mail belongs to the parent account itself, shared by its children.
+export function fetchSkolengoMessages(
+  account: Skolengo,
+  count: number,
+  saveToken?: (token: string) => Promise<void>
+): Promise<MessageItem[]> {
+  const run = (skolengoDataQueues.get(account) || Promise.resolve()).then(async () => {
+    const { student: owner, request } = await skolengoStudent(account, account.userId, saveToken);
+    const settings = await request(() => owner.GetMailSettings());
+    const inbox = settings.folders.find((folder) => folder.type === "INBOX") || settings.folders[0];
+    if (!inbox) throw new Error("Boîte de réception Skolengo introuvable.");
+    const mails = await request(() => owner.GetMailFromFolder(inbox.id, count, 0));
+    return mails.map((mail) => ({
+      id: mail.id,
+      subject: mail.subject || "(sans objet)",
+      from: mail.sender?.name || mail.participants?.[0] || "Skolengo",
+      date: toLocalDateTime(mail.date),
+      read: !!mail.read,
+      preview: messagePreview(mail.content || "")
+    })).sort(byDateDesc).slice(0, count);
   });
   skolengoDataQueues.set(account, run.catch(() => undefined));
   return run;

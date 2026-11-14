@@ -13,7 +13,8 @@ import {
   Switch,
   Text,
   TextInput,
-  View
+  View,
+  type LayoutChangeEvent
 } from "react-native";
 import { StatusBar } from "expo-status-bar";
 import * as Notifications from "expo-notifications";
@@ -44,8 +45,11 @@ import {
 import { WebView } from "react-native-webview";
 import { PronoteSsoModal } from "./src/PronoteSsoModal";
 import { PhotoWebViewHost } from "./src/PhotoWebViewHost";
-import { getCachedPhoto, inlinePhoto } from "./src/photos";
-import { USER_AGENT as ED_PHOTO_USER_AGENT } from "./src/ecoleDirecte";
+import { CHILDREN_PROFILES_KEY, PROVIDER_ACCOUNTS_KEY, persistProviderAccounts, providerTokenKey, readProviderAccounts } from "./src/accountStorage";
+import { findFirstCourseDay, syncChildren } from "./src/sync";
+import { DevTools } from "./src/DevTools";
+import { forgetPhoto, getCachedPhoto, photoCacheKey } from "./src/photos";
+import "./src/photoStore";
 import { pronoteBaseUrl, type PronoteSsoCapture } from "./src/providers/pronoteSso";
 import {
   getCurrentOrNextHoliday,
@@ -67,7 +71,6 @@ import {
 } from "./src/backgroundSync";
 import {
   createEdSession,
-  fetchSchoolData,
   fetchLoginChallenge,
   fetchStudentsSchoolDataWithAutoAdvance,
   login,
@@ -88,8 +91,6 @@ import {
 } from "./src/reminders";
 import {
   connectPronoteSso,
-  fetchPronoteData,
-  fetchSkolengoData,
   finishSkolengoLogin,
   restorePronote,
   restoreSkolengoLogin,
@@ -106,19 +107,9 @@ import type {
   ProviderType
 } from "./src/providers/types";
 
-const CHILDREN_PROFILES_KEY = "tempo-children-profiles-v3";
-const PROVIDER_ACCOUNTS_KEY = "tempo-provider-accounts-v1";
 const ACTIVE_CHILD_KEY = "tempo-active-child-id-v2";
 
-function providerTokenKey(accountId: string): string {
-  let hash = 2166136261;
-  for (const character of accountId) {
-    hash = Math.imul(hash ^ character.charCodeAt(0), 16777619);
-  }
-  return `tempo-provider-token-${(hash >>> 0).toString(16)}`;
-}
-
-Notifications.setNotificationHandler({
+if (Platform.OS !== "web") Notifications.setNotificationHandler({
   handleNotification: async () => ({
     shouldShowBanner: true,
     shouldShowList: true,
@@ -396,6 +387,13 @@ function homeworkDocument(content: string): string {
   return documentContent;
 }
 
+type JournalSection = "courses" | "homeworks" | "grades";
+const JOURNAL_SECTIONS: { id: JournalSection; label: string; unit: string; Icon: typeof BookOpen; color: "green" | "coral" | "blue"; tint: "summaryMint" | "summaryPeach" | "summaryBlue" }[] = [
+  { id: "courses", label: "Emploi du temps", unit: "cours", Icon: BookOpen, color: "green", tint: "summaryMint" },
+  { id: "homeworks", label: "Devoirs", unit: "devoirs", Icon: ClipboardList, color: "coral", tint: "summaryPeach" },
+  { id: "grades", label: "Notes", unit: "élèves avec note", Icon: GraduationCap, color: "blue", tint: "summaryBlue" }
+];
+
 function ChildProfilesBar({
   children,
   providerAccounts,
@@ -440,7 +438,8 @@ function ChildProfilesBar({
               onPress={() => onSelectChild(child.id)}
               style={[
                 styles.childChip,
-                active && styles.childChipActive
+                active && styles.childChipActive,
+                !!normalizePhotoUri(photo) && styles.childChipWithPhoto
               ]}
             >
               <ChildProfileAvatar photo={photo} active={active} name={child.firstName || "Enfant"} />
@@ -544,7 +543,7 @@ function AppContent() {
   const [data, setData] = useState<SchoolData[] | null>(null);
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
-  const [rememberCredentials, setRememberCredentials] = useState(false);
+  const [rememberCredentials, setRememberCredentials] = useState(Platform.OS === "web");
   const [twoFactorFactors, setTwoFactorFactors] = useState<{ cn: string; cv: string } | undefined>();
   const [backgroundSyncEnabled, setBackgroundSyncEnabled] = useState(false);
   const [accountSettingsOpen, setAccountSettingsOpen] = useState(false);
@@ -570,6 +569,8 @@ function AppContent() {
   const childrenProfilesRef = useRef(childrenProfiles);
   const preferencesRef = useRef(preferences);
   const selectedDayRef = useRef(selectedDay);
+  const contentScrollRef = useRef<ScrollView>(null);
+  const journalSectionOffsets = useRef<Partial<Record<JournalSection, number>>>({});
   providerAccountsRef.current = providerAccounts;
   childrenProfilesRef.current = childrenProfiles;
   preferencesRef.current = preferences;
@@ -579,23 +580,6 @@ function AppContent() {
     account.provider === provider && providerSessionsRef.current.has(account.id)
   );
 
-  const persistProviderAccounts = async (accounts: ProviderAccount[], remember: boolean) => {
-    const metadata = accounts.map(({ refreshToken: _refreshToken, ...account }) => ({
-      ...account,
-      // Les photos téléchargées (data URI) sont trop lourdes pour SecureStore.
-      students: account.students.map((student) => ({
-        ...student,
-        photo: student.photo?.startsWith("data:") || account.provider === "pronote" ? undefined : student.photo
-      }))
-    }));
-    await SecureStore.setItemAsync(PROVIDER_ACCOUNTS_KEY, JSON.stringify(metadata));
-    await Promise.all(accounts.map((account) => {
-      const tokenKey = providerTokenKey(account.id);
-      return remember && account.refreshToken
-        ? SecureStore.setItemAsync(tokenKey, account.refreshToken)
-        : SecureStore.deleteItemAsync(tokenKey);
-    }));
-  };
   const dataRef = useRef<SchoolData[] | null>(null);
   dataRef.current = data;
 
@@ -710,14 +694,16 @@ function AppContent() {
     if (!nextChildren.some((child) => child.id === activeChildId)) {
       selectActiveChild(nextChildren[0]?.id || null);
     }
-    const disabledBackgroundSync = account.provider !== "ecoleDirecte" && backgroundSyncEnabled;
-    if (disabledBackgroundSync) {
+    if (remember && account.refreshToken) {
+      await SecureStore.setItemAsync(providerTokenKey(account.id), account.refreshToken);
+    }
+    await persistProviderAccounts(nextAccounts, remember);
+    if (!remember && backgroundSyncEnabled) {
       await disableBackgroundSync();
       setBackgroundSyncEnabled(false);
     }
-    await persistProviderAccounts(nextAccounts, remember);
     await SecureStore.setItemAsync(CHILDREN_PROFILES_KEY, JSON.stringify(nextChildren));
-    setNotice(`${account.label} connecté : ${account.students.length} enfant${account.students.length === 1 ? "" : "s"} trouvé${account.students.length === 1 ? "" : "s"}.${disabledBackgroundSync ? " La synchronisation en arrière-plan a été désactivée car elle ne couvre qu’École Directe." : ""}`);
+    setNotice(`${account.label} connecté : ${account.students.length} enfant${account.students.length === 1 ? "" : "s"} trouvé${account.students.length === 1 ? "" : "s"}.${!remember && backgroundSyncEnabled ? " Synchronisation périodique désactivée : ce compte n'est pas mémorisé." : ""}`);
     return nextChildren;
   };
 
@@ -728,7 +714,7 @@ function AppContent() {
     setChildrenProfiles(nextChildren);
     childrenProfilesRef.current = nextChildren;
     await SecureStore.setItemAsync(CHILDREN_PROFILES_KEY, JSON.stringify(nextChildren));
-    const nextData = await fetchConnectedChildrenData(nextChildren);
+    const nextData = await fetchConnectedChildrenData(nextChildren, selectedDayRef.current);
     setData(nextData);
     selectActiveChild(null);
     await scheduleDailyReminders(preferences, nextData).catch(() => false);
@@ -737,6 +723,7 @@ function AppContent() {
   const removeProviderAccount = async (account: ProviderAccount) => {
     const nextAccounts = providerAccounts.filter((item) => item.id !== account.id);
     providerSessionsRef.current.delete(account.id);
+    await Promise.all(account.students.map((student) => forgetPhoto(photoCacheKey(account.provider, student.id))));
     const nextChildren = childrenProfiles.flatMap((child) => {
       const links = { ...child.links };
       if (links[account.provider]?.accountId === account.id) delete links[account.provider];
@@ -798,105 +785,46 @@ function AppContent() {
     }, session, remember);
   };
 
+  // Without a date, the sync shows the first day (today included) that still has a course to come.
   const fetchConnectedChildrenData = async (
     childrenToFetch = childrenProfiles,
-    timetableDate = selectedDayRef.current,
+    timetableDate?: Date,
     homeworkDays = preferencesRef.current.homeworkDays
   ): Promise<SchoolData[]> => {
-    const combined: SchoolData[] = [];
-    for (const [index, child] of childrenToFetch.entries()) {
-      const domainData: Partial<Record<ProviderType, SchoolData & { studentPhoto?: string }>> = {};
-      const errors: string[] = [];
-      const selectedProviders = [...new Set(
-        Object.values(child.sources).filter((provider): provider is ProviderType => provider !== null)
-      )];
-      for (const provider of selectedProviders) {
-        const link = child.links[provider];
-        const account = link && providerAccountsRef.current.find((item) => item.id === link.accountId);
-        const session = link && providerSessionsRef.current.get(link.accountId);
-        if (!link || !account || !session) {
-          errors.push(`${provider} n’est pas connecté.`);
-          continue;
+    const connectionErrors = new Map<string, string>();
+    for (const saved of await readProviderAccounts()) {
+      const current = providerAccountsRef.current.find((account) => account.id === saved.id);
+      if (!current || !saved.refreshToken || saved.provider === "ecoleDirecte") continue;
+      if (saved.refreshToken === current.refreshToken && providerSessionsRef.current.has(saved.id)) continue;
+      try {
+        if (saved.provider === "pronote") {
+          const restored = await restorePronote(saved.refreshToken, (token) =>
+            SecureStore.setItemAsync(providerTokenKey(saved.id), token));
+          providerSessionsRef.current.set(saved.id, restored.session);
+          current.refreshToken = restored.refreshToken;
+          current.students = restored.students;
+        } else if (saved.school) {
+          const restored = await restoreSkolengoLogin(saved.refreshToken, saved.school);
+          await SecureStore.setItemAsync(providerTokenKey(saved.id), restored.account.refreshToken);
+          providerSessionsRef.current.set(saved.id, restored.account);
+          current.refreshToken = restored.account.refreshToken;
         }
-        try {
-          if (provider === "ecoleDirecte") {
-            const edSession = session as EdSession;
-            const pupil = edSession.pupils?.find((item) => String(item.id) === link.studentId);
-            if (!pupil) throw new Error("Élève École Directe indisponible.");
-            domainData[provider] = await fetchSchoolData(edSession, homeworkDays, pupil, timetableDate);
-          } else if (provider === "pronote") {
-            const data = await fetchPronoteData(
-              session as Extract<ProviderSession, { children: unknown }>,
-              link.studentId,
-              timetableDate,
-              homeworkDays
-            );
-            domainData[provider] = {
-              student: { id: index + 1, prenom: child.firstName, nom: child.lastName },
-              ...data,
-              latestGrade: data.grades[0] || null,
-              syncedAt: new Date().toISOString()
-            };
-          } else {
-            const data = await fetchSkolengoData(
-              session as Extract<ProviderSession, { GetTimetable: unknown }>,
-              link.studentId,
-              timetableDate,
-              homeworkDays
-            );
-            domainData[provider] = {
-              student: { id: index + 1, prenom: child.firstName, nom: child.lastName },
-              ...data,
-              latestGrade: data.grades[0] || null,
-              syncedAt: new Date().toISOString()
-            };
-          }
-        } catch (error) {
-          errors.push((error as Error).message);
-        }
+      } catch (error) {
+        console.warn("[APP] Could not renew provider session:", error);
+        providerSessionsRef.current.delete(saved.id);
+        connectionErrors.set(saved.id, error instanceof Error ? error.message : String(error));
       }
-      const courses = child.sources.courses ? domainData[child.sources.courses]?.courses || [] : [];
-      const homeworks = child.sources.homeworks ? domainData[child.sources.homeworks]?.homeworks || [] : [];
-      const gradeSource = child.sources.grades ? domainData[child.sources.grades] : undefined;
-
-      const photoProvider = child.sources.photo;
-      const fetchedPhoto = photoProvider
-        ? normalizePhotoUri(domainData[photoProvider]?.studentPhoto || domainData[photoProvider]?.student?.photo)
-        : undefined;
-      const rawPhotoUri = fetchedPhoto || childProfilePhoto(child, providerAccountsRef.current);
-      const photoUri = await inlinePhoto(rawPhotoUri, (photoProvider || "photo").toUpperCase(),
-        photoProvider === "ecoleDirecte"
-          ? { "User-Agent": ED_PHOTO_USER_AGENT, Referer: "https://www.ecoledirecte.com/" }
-          : {});
-      console.info("[PHOTO-RESOLUTION] Photo du profil résolue.", {
-        provider: photoProvider || null,
-        fetchedPhoto: photoUriDiagnostic(fetchedPhoto),
-        resolvedPhoto: photoUriDiagnostic(photoUri)
-      });
-
-      const firstSuccessfulData = Object.values(domainData).find(Boolean);
-      combined.push({
-        student: {
-          id: index + 1,
-          prenom: child.firstName,
-          nom: child.lastName,
-          photo: photoUri,
-          classe: { libelle: child.className }
-        },
-        courses,
-        homeworks,
-        grades: gradeSource?.grades || [],
-        competencies: gradeSource?.competencies || [],
-        latestGrade: gradeSource?.latestGrade || null,
-        gradesError: gradeSource?.gradesError,
-        syncedAt: new Date().toISOString(),
-        ...(!firstSuccessfulData && errors.length ? { error: errors.join(" ") } : {})
-      });
     }
-    return combined;
+    let day = timetableDate;
+    if (!day) {
+      day = await findFirstCourseDay(childrenToFetch, providerAccountsRef.current, providerSessionsRef.current);
+      selectedDayRef.current = day;
+      setSelectedDay(day);
+    }
+    return syncChildren(childrenToFetch, providerAccountsRef.current, providerSessionsRef.current, day, homeworkDays, connectionErrors);
   };
 
-  const refreshConnectedChildren = async (timetableDate = selectedDay) => {
+  const refreshConnectedChildren = async (timetableDate?: Date) => {
     const nextData = await fetchConnectedChildrenData(childrenProfiles, timetableDate);
     setData(nextData);
     selectActiveChild(null);
@@ -944,7 +872,8 @@ function AppContent() {
         if (!savedAccount.refreshToken) continue;
         try {
           if (savedAccount.provider === "pronote" && savedAccount.url) {
-            const restored = await restorePronote(savedAccount.refreshToken);
+            const restored = await restorePronote(savedAccount.refreshToken, (token) =>
+              SecureStore.setItemAsync(providerTokenKey(savedAccount.id), token));
             providerSessionsRef.current.set(savedAccount.id, restored.session);
             savedAccount.refreshToken = restored.refreshToken;
             savedAccount.students = restored.students;
@@ -954,6 +883,7 @@ function AppContent() {
             const restored = await restoreSkolengoLogin(savedAccount.refreshToken, savedAccount.school);
             providerSessionsRef.current.set(savedAccount.id, restored.account);
             savedAccount.refreshToken = restored.account.refreshToken;
+            await SecureStore.setItemAsync(providerTokenKey(savedAccount.id), savedAccount.refreshToken);
             savedAccount.students = restored.students;
             savedAccount.parentName = [restored.account.firstName, restored.account.lastName].filter(Boolean).join(" ") || "Compte parent";
             savedAccount.label = savedAccount.parentName;
@@ -1007,21 +937,21 @@ function AppContent() {
             factors?: { cn: string; cv: string };
           };
           setUsername(saved.username);
-          setPassword(saved.password);
+          setPassword(saved.password || "");
           setTwoFactorFactors(saved.factors);
           setRememberCredentials(true);
-          if (saved.username && saved.password) {
-            void performAutoLogin(saved.username, saved.password, activePrefs, saved.factors);
+          if (saved.username && (saved.password || saved.accessToken)) {
+            await performAutoLogin(saved.username, saved.password || "", activePrefs, saved.factors, saved.accessToken, saved.accountType);
           }
         } catch {
           void SecureStore.deleteItemAsync(CREDENTIALS_KEY);
         }
       }
-      if (!savedCredentials && hasRestoredSession && restoredChildren.length) {
+      if (hasRestoredSession && restoredChildren.length) {
         try {
           const restoredData = await fetchConnectedChildrenData(
             restoredChildren,
-            selectedDayRef.current,
+            undefined,
             activePrefs.homeworkDays
           );
           setData(restoredData);
@@ -1032,19 +962,10 @@ function AppContent() {
         }
       }
       if (backgroundSyncFlag === "true") {
-        const externalSessionActive = restoredAccounts.some((account) =>
-          account.provider !== "ecoleDirecte" && providerSessionsRef.current.has(account.id)
-        );
-        if (externalSessionActive) {
-          await disableBackgroundSync();
+        void enableBackgroundSync().then(() => setBackgroundSyncEnabled(true)).catch((error) => {
           setBackgroundSyncEnabled(false);
-          setNotice("La synchronisation en arrière-plan a été désactivée car elle ne couvre qu’École Directe.");
-        } else {
-          setBackgroundSyncEnabled(true);
-          void enableBackgroundSync().catch((error) => {
-            setNotice(`Synchronisation périodique indisponible : ${(error as Error).message}`);
-          });
-        }
+          setNotice(`Synchronisation périodique indisponible : ${(error as Error).message}`);
+        });
       }
     });
     return () => {
@@ -1058,7 +979,7 @@ function AppContent() {
       if (providerAccountsRef.current.some((account) => account.provider !== "ecoleDirecte")) {
         void fetchConnectedChildrenData(
           childrenProfilesRef.current,
-          selectedDayRef.current,
+          undefined,
           preferencesRef.current.homeworkDays
         ).then(async (latestData) => {
           setData(latestData);
@@ -1091,7 +1012,9 @@ function AppContent() {
     userToUse: string,
     passToUse: string,
     prefsToUse: ReminderPreferences,
-    factors?: { cn: string; cv: string }
+    factors?: { cn: string; cv: string },
+    savedAccessToken?: string,
+    accountType = "E"
   ) => {
     console.log("[APP] Starting auto-login...");
     setBusy(true);
@@ -1101,13 +1024,19 @@ function AppContent() {
     const uuid = savedUuid || Crypto.randomUUID();
     if (!savedUuid) await SecureStore.setItemAsync(DEVICE_KEY, uuid);
     try {
-      await login(session, userToUse.trim(), passToUse, uuid, factors);
+      if (savedAccessToken) {
+        await relogin(session, userToUse.trim(), uuid, savedAccessToken, accountType, factors);
+      } else {
+        await login(session, userToUse.trim(), passToUse, uuid, factors);
+      }
+      await SecureStore.setItemAsync(CREDENTIALS_KEY, JSON.stringify({
+        username: userToUse.trim(), password: passToUse, accessToken: session.accessToken,
+        accountType: session.student?.typeCompte, factors: session.twoFactorFactors
+      }));
       sessionRef.current = session;
       const connectedChildren = await registerEcoleDirecteConnection(session, userToUse.trim(), uuid, true);
       console.log("[APP] Auto-login succeeded. Fetching school data...");
-      const syncResult = await fetchStudentsSchoolDataWithAutoAdvance(session, prefsToUse.homeworkDays, selectedDay);
-      setSelectedDay(syncResult.selectedDay);
-      const latestData = await fetchConnectedChildrenData(connectedChildren, syncResult.selectedDay, prefsToUse.homeworkDays);
+      const latestData = await fetchConnectedChildrenData(connectedChildren, undefined, prefsToUse.homeworkDays);
       setData(latestData);
       selectActiveChild(null);
       await scheduleDailyReminders(prefsToUse, latestData).catch(() => false);
@@ -1179,9 +1108,7 @@ function AppContent() {
     }
     try {
       console.log("[APP] Fetching school data after login...");
-      const syncResult = await fetchStudentsSchoolDataWithAutoAdvance(session, preferences.homeworkDays, selectedDay);
-      setSelectedDay(syncResult.selectedDay);
-      const latestData = await fetchConnectedChildrenData(connectedChildren, syncResult.selectedDay, preferences.homeworkDays);
+      const latestData = await fetchConnectedChildrenData(connectedChildren, undefined, preferences.homeworkDays);
       setData(latestData);
       await scheduleDailyReminders(preferences, latestData).catch(() => false);
       const failedPupils = latestData.filter((studentData) => studentData.error);
@@ -1298,8 +1225,9 @@ function AppContent() {
     setBusy(true);
     setNotice("");
     try {
-      const result = await connectPronoteSso(capture);
-      const accountId = `pronote:${normalizeIdentity(result.url)}:${normalizeIdentity(result.parentName)}`;
+      const accountId = `pronote:${normalizeIdentity(capture.url)}:${normalizeIdentity(capture.username)}`;
+      const result = await connectPronoteSso(capture, (token) =>
+        SecureStore.setItemAsync(providerTokenKey(accountId), token));
       const nextChildren = await addProviderConnection({
         id: accountId,
         provider: "pronote",
@@ -1434,7 +1362,8 @@ function AppContent() {
     }
   };
 
-  const refresh = async (timetableDate = selectedDay) => {
+  // Without a date (sync button, resume), jump to the first day that still has a course to come.
+  const refresh = async (timetableDate?: Date) => {
     console.log("[APP] Refreshing data...");
     if (!sessionRef.current && providerAccounts.length === 0 && username.trim() && password) {
       console.log("[APP] No active session, attempting connect()...");
@@ -1449,7 +1378,7 @@ function AppContent() {
         Object.values(child.sources).some((provider) => provider !== "ecoleDirecte")
       );
       if (!sessionRef.current || usesExternalProvider) {
-        setSelectedDay(timetableDate);
+        if (timetableDate) setSelectedDay(timetableDate);
         const latestData = await refreshConnectedChildren(timetableDate);
         const failedChildren = latestData.filter((entry) => entry.error);
         setNotice(failedChildren.length
@@ -1512,9 +1441,7 @@ function AppContent() {
               factors: session.twoFactorFactors
             }));
           }
-          const syncResult = await fetchStudentsSchoolDataWithAutoAdvance(session, preferences.homeworkDays, timetableDate);
-          setSelectedDay(syncResult.selectedDay);
-          const latestData = await fetchConnectedChildrenData(connectedChildren, syncResult.selectedDay, preferences.homeworkDays);
+          const latestData = await fetchConnectedChildrenData(connectedChildren, timetableDate, preferences.homeworkDays);
           setData(latestData);
           await scheduleDailyReminders(preferences, latestData).catch(() => false);
           const failedPupils = latestData.filter((studentData) => studentData.error);
@@ -1796,10 +1723,16 @@ function AppContent() {
             <Pressable
               accessibilityRole="button"
               accessibilityLabel={`Déconnecter ${serviceLabel}`}
-              onPress={() => Alert.alert("Déconnecter ce service ?", serviceLabel, [
-                { text: "Annuler", style: "cancel" },
-                { text: "Déconnecter", style: "destructive", onPress: () => void removeProviderAccount(account) }
-              ])}
+              onPress={() => {
+                if (Platform.OS === "web") {
+                  if (window.confirm(`Déconnecter ${serviceLabel} ?`)) void removeProviderAccount(account);
+                } else {
+                  Alert.alert("Déconnecter ce service ?", serviceLabel, [
+                    { text: "Annuler", style: "cancel" },
+                    { text: "Déconnecter", style: "destructive", onPress: () => void removeProviderAccount(account) }
+                  ]);
+                }
+              }}
               style={styles.providerDisconnectButton}
             >
               <LogOut size={16} color={palette.coral} />
@@ -1994,21 +1927,63 @@ function AppContent() {
     </View>
   );
 
+  const rememberSectionOffset = (section: JournalSection) => (event: LayoutChangeEvent) => {
+    journalSectionOffsets.current[section] = event.nativeEvent.layout.y;
+  };
+
+  const scrollToSection = (section: JournalSection) => {
+    const offset = journalSectionOffsets.current[section];
+    if (offset !== undefined) contentScrollRef.current?.scrollTo({ y: Math.max(0, offset - 8), animated: true });
+  };
+
+  // Stays above the scrolling content so children and sections remain reachable.
+  const renderJournalBar = () => {
+    const showSections = !getCurrentOrNextHoliday(schoolZone).currentHoliday;
+    if (!childrenProfiles.length && !showSections) return null;
+    return (
+      <View style={styles.journalBar}>
+        {childrenProfiles.length > 0 && (
+          <ChildProfilesBar
+            children={childrenProfiles}
+            providerAccounts={providerAccounts}
+            activeChildId={activeChildId}
+            onSelectChild={selectActiveChild}
+            onAddChild={() => setTab("compte")}
+          />
+        )}
+        {showSections && (
+          <View style={styles.sectionLinks}>
+            {JOURNAL_SECTIONS.map(({ id, label, unit, Icon, color, tint }) => {
+              const count = { courses: courseCount, homeworks: homeworkCount, grades: gradeCount }[id];
+              return (
+                <Pressable
+                  key={id}
+                  accessibilityRole="link"
+                  accessibilityLabel={`Aller à la section ${label}`}
+                  onPress={() => scrollToSection(id)}
+                  style={[styles.sectionLink, styles[tint]]}
+                >
+                  <View style={styles.sectionLinkHeader}>
+                    <Icon size={15} color={palette[color]} />
+                    <Text style={styles.sectionLinkText} numberOfLines={1}>{label}</Text>
+                  </View>
+                  <View style={styles.sectionLinkCount}>
+                    <Text style={styles.sectionLinkValue}>{data ? count : "—"}</Text>
+                    <Text style={styles.summaryLabel} numberOfLines={1}>{unit}</Text>
+                  </View>
+                </Pressable>
+              );
+            })}
+          </View>
+        )}
+      </View>
+    );
+  };
+
   const renderJournal = () => {
     const currentHoliday = getCurrentOrNextHoliday(schoolZone).currentHoliday;
     return (
       <>
-      {childrenProfiles.length > 0 && (
-        <ChildProfilesBar
-          children={childrenProfiles}
-          providerAccounts={providerAccounts}
-          activeChildId={activeChildId}
-          onSelectChild={selectActiveChild}
-          onAddChild={() => {
-            setTab("compte");
-          }}
-        />
-      )}
       {currentHoliday ? (
         renderHolidaysCard(true)
       ) : (
@@ -2041,25 +2016,7 @@ function AppContent() {
         )}
       </View>
 
-      <View style={styles.summaryRow}>
-        <View style={[styles.summaryBlock, styles.summaryMint]}>
-          <BookOpen size={18} color={palette.green} />
-          <Text style={styles.summaryValue}>{data ? courseCount : "—"}</Text>
-          <Text style={styles.summaryLabel}>cours</Text>
-        </View>
-        <View style={[styles.summaryBlock, styles.summaryPeach]}>
-          <ClipboardList size={18} color={palette.coral} />
-          <Text style={styles.summaryValue}>{data ? homeworkCount : "—"}</Text>
-          <Text style={styles.summaryLabel}>devoirs</Text>
-        </View>
-        <View style={[styles.summaryBlock, styles.summaryBlue]}>
-          <GraduationCap size={19} color={palette.blue} />
-          <Text style={styles.summaryValue}>{data ? gradeCount : "—"}</Text>
-          <Text style={styles.summaryLabel}>élèves avec note</Text>
-        </View>
-      </View>
-
-      <View style={styles.sectionHeading}>
+      <View style={styles.sectionHeading} onLayout={rememberSectionOffset("courses")}>
         <Text style={styles.sectionTitle}>Emploi du temps</Text>
         <View style={styles.dayNavigation}>
           <Pressable
@@ -2106,7 +2063,7 @@ function AppContent() {
         ))}
       </View>
 
-      <View style={styles.sectionHeading}>
+      <View style={styles.sectionHeading} onLayout={rememberSectionOffset("homeworks")}>
         <Text style={styles.sectionTitle}>À préparer</Text>
         <Text style={styles.sectionMeta}>{preferences.homeworkDays} jours</Text>
       </View>
@@ -2143,7 +2100,7 @@ function AppContent() {
         ))}
       </View>
 
-      <View style={styles.sectionHeading}>
+      <View style={styles.sectionHeading} onLayout={rememberSectionOffset("grades")}>
         <Text style={styles.sectionTitle}>Dernières notes</Text>
       </View>
       <View style={styles.listSection}>
@@ -2278,7 +2235,7 @@ function AppContent() {
         <Text style={styles.pageTitle}>Comptes parents</Text>
         <Text style={styles.pageDescription}>Relie les services scolaires utilisés par ta famille.</Text>
       </View>
-      {sessionRef.current && (
+      {providerAccounts.length > 0 && (
         <View style={styles.settingsMenu}>
           <Pressable
             accessibilityRole="button"
@@ -2304,7 +2261,7 @@ function AppContent() {
                 <Switch
                   value={backgroundSyncEnabled}
                   onValueChange={(enabled) => void updateBackgroundSync(enabled)}
-                  disabled={busy || (!rememberCredentials && !backgroundSyncEnabled)}
+                  disabled={busy || Platform.OS !== "android" || (!rememberCredentials && !backgroundSyncEnabled)}
                   trackColor={{ false: "#D4DBD7", true: "#76CBB0" }}
                   thumbColor={backgroundSyncEnabled ? palette.green : "#FFFFFF"}
                 />
@@ -2339,6 +2296,7 @@ function AppContent() {
                   <Text style={styles.settingsStatusText}>
                     Notifications émises après synchro : {backgroundSyncStatus.lastNotificationsSent ?? "—"}
                   </Text>
+                  {!!backgroundSyncStatus.lastError && <Text style={styles.settingsStatusText}>{backgroundSyncStatus.lastError}</Text>}
                 </View>
               )}
             </View>
@@ -2388,11 +2346,14 @@ function AppContent() {
         <Text style={styles.connectionLabel}>{data ? "Connecté" : "Hors ligne"}</Text>
       </View>
 
+      {tab === "journal" && renderJournalBar()}
       <ScrollView
+        ref={contentScrollRef}
         keyboardShouldPersistTaps="handled"
         contentContainerStyle={styles.content}
         showsVerticalScrollIndicator={false}
       >
+        <DevTools />
         {!!notice && <Text accessibilityRole="alert" style={styles.notice}>{notice}</Text>}
         {tab === "journal" && renderJournal()}
         {tab === "rappels" && renderReminders()}
@@ -2609,12 +2570,9 @@ const styles = StyleSheet.create({
   dayNavigation: { flexDirection: "row", alignItems: "center", gap: 8 },
   dayNavigationButton: { width: 32, height: 32, alignItems: "center", justifyContent: "center", borderRadius: 9, backgroundColor: "#E7F2ED" },
   iconButton: { width: 34, height: 34, alignItems: "center", justifyContent: "center", borderRadius: 10, backgroundColor: "#E7F2ED" },
-  summaryRow: { flexDirection: "row", gap: 8 },
-  summaryBlock: { flex: 1, minHeight: 103, borderRadius: 14, padding: 12, justifyContent: "space-between" },
   summaryMint: { backgroundColor: "#E2F1EA" },
   summaryPeach: { backgroundColor: "#F8E8E0" },
   summaryBlue: { backgroundColor: "#E5EDF3" },
-  summaryValue: { color: palette.ink, fontSize: 19, fontWeight: "700", marginTop: 8 },
   summaryLabel: { color: palette.muted, fontSize: 10, fontWeight: "600" },
   listSection: { backgroundColor: palette.surface, borderRadius: 14, paddingHorizontal: 14, borderWidth: 1, borderColor: palette.line },
   listRow: { minHeight: 66, flexDirection: "row", alignItems: "center", borderBottomWidth: 1, borderBottomColor: palette.line },
@@ -2683,11 +2641,20 @@ const styles = StyleSheet.create({
   closeButton: { width: 38, height: 38, alignItems: "center", justifyContent: "center", backgroundColor: palette.background },
   homeworkWebView: { flex: 1, backgroundColor: "#FFFFFF" },
   loginPanel: { padding: 17, borderRadius: 16, borderWidth: 1, borderColor: palette.line, backgroundColor: "#FFFFFF" },
-  childBarContainer: { marginTop: 8, marginBottom: 12 },
+  childBarContainer: { marginTop: 8, marginBottom: 8 },
+  journalBar: { paddingHorizontal: 20, paddingBottom: 8, backgroundColor: palette.background, borderBottomWidth: 1, borderBottomColor: palette.line },
+  sectionLinks: { flexDirection: "row", gap: 6 },
+  sectionLink: { flex: 1, minWidth: 0, borderRadius: 14, paddingHorizontal: 10, paddingVertical: 8, gap: 4 },
+  sectionLinkHeader: { flexDirection: "row", alignItems: "center", gap: 5 },
+  sectionLinkText: { flexShrink: 1, color: palette.ink, fontSize: 12, fontWeight: "700" },
+  sectionLinkCount: { flexDirection: "row", alignItems: "baseline", gap: 4 },
+  sectionLinkValue: { color: palette.ink, fontSize: 18, fontWeight: "700" },
   childBarScroll: { flexDirection: "row", gap: 8, paddingHorizontal: 2 },
   childChip: { flexDirection: "row", alignItems: "center", gap: 6, paddingVertical: 8, paddingHorizontal: 12, borderRadius: 20, borderWidth: 1, borderColor: palette.line, backgroundColor: "#FFFFFF" },
   childChipActive: { backgroundColor: palette.green, borderColor: palette.green },
-  childChipPhoto: { width: 20, height: 20, borderRadius: 10, backgroundColor: "#E2F1EA" },
+  // The photo fills the whole chip circle; the 2px border marks the selection.
+  childChipWithPhoto: { padding: 0, minWidth: 36, height: 36, borderRadius: 18, borderWidth: 2, overflow: "hidden", justifyContent: "center" },
+  childChipPhoto: { width: 32, height: 32, borderRadius: 16, backgroundColor: "#E2F1EA" },
   childChipText: { fontSize: 12, fontWeight: "700", color: palette.ink },
   childChipTextActive: { color: "#FFFFFF" },
   childChipAdd: { flexDirection: "row", alignItems: "center", gap: 4, paddingVertical: 8, paddingHorizontal: 12, borderRadius: 20, borderWidth: 1, borderColor: palette.line, backgroundColor: "#E7F2ED" },

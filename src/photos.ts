@@ -1,3 +1,5 @@
+import { Buffer } from "buffer";
+
 const USER_AGENT =
   "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36";
 
@@ -15,12 +17,14 @@ function notifyWebView(): void {
   const requests = [...pendingWebView.entries()].map(([id, { url, headers }]) => ({ id, url, headers }));
   webViewListeners.forEach((listener) => listener(requests));
 }
-
 export function subscribeWebViewPhotoRequests(listener: WebViewListener): () => void {
   webViewListeners.add(listener);
   notifyWebView();
   return () => {
     webViewListeners.delete(listener);
+    if (!webViewListeners.size) {
+      for (const id of [...pendingWebView.keys()]) completeWebViewPhoto(id);
+    }
   };
 }
 
@@ -35,6 +39,7 @@ export function completeWebViewPhoto(id: number, dataUri?: string): void {
 
 // Le WebView passe par la pile réseau de Chrome, acceptée par les serveurs qui coupent okhttp.
 function webViewPhoto(url: string, headers: Record<string, string>): Promise<string | undefined> {
+  if (!webViewListeners.size) return Promise.resolve(undefined);
   return new Promise((resolve) => {
     const id = nextRequestId++;
     const timer = setTimeout(() => completeWebViewPhoto(id, undefined), 20000);
@@ -44,6 +49,9 @@ function webViewPhoto(url: string, headers: Record<string, string>): Promise<str
 }
 
 function blobToDataUri(blob: Blob): Promise<string> {
+  if (typeof FileReader === "undefined") {
+    return blob.arrayBuffer().then((bytes) => `data:${blob.type};base64,${Buffer.from(bytes).toString("base64")}`);
+  }
   return new Promise((resolve, reject) => {
     const reader = new FileReader();
     reader.onloadend = () => resolve(String(reader.result));
@@ -101,13 +109,90 @@ export function getCachedPhoto(url: string | undefined): string | undefined {
   return url ? cache.get(url) : undefined;
 }
 
+export type PhotoStore = {
+  read(key: string): Promise<{ dataUri: string; savedAt: number } | undefined>;
+  write(key: string, dataUri: string): Promise<void>;
+  remove(key: string): Promise<void>;
+};
+
+// Registered by the native app only; the web service and tests keep an in-memory cache.
+let photoStore: PhotoStore | undefined;
+export function setPhotoStore(store: PhotoStore): void {
+  photoStore = store;
+}
+
+const PHOTO_MAX_AGE_MS = 30 * 24 * 60 * 60 * 1000;
+const studentPhotos = new Map<string, string>();
+const studentInflight = new Map<string, Promise<string | undefined>>();
+
+export function photoCacheKey(provider: string, studentId: string | number): string {
+  return `${provider}:${studentId}`;
+}
+
+// Any stored photo, even outdated: enough to display avatars before the first sync.
+export async function storedPhoto(key: string): Promise<string | undefined> {
+  return studentPhotos.get(key) ?? (await photoStore?.read(key).catch(() => undefined))?.dataUri;
+}
+
+export async function forgetPhoto(key: string): Promise<void> {
+  studentPhotos.delete(key);
+  await photoStore?.remove(key).catch(() => undefined);
+}
+
+// Downloads at most once every 30 days per student; an outdated photo is kept if the refresh fails.
+export function cachedPhoto(key: string, download: () => Promise<string | undefined>): Promise<string | undefined> {
+  const memory = studentPhotos.get(key);
+  if (memory) return Promise.resolve(memory);
+  let task = studentInflight.get(key);
+  if (!task) {
+    task = loadStudentPhoto(key, download).finally(() => studentInflight.delete(key));
+    studentInflight.set(key, task);
+  }
+  return task;
+}
+
+async function loadStudentPhoto(key: string, download: () => Promise<string | undefined>): Promise<string | undefined> {
+  const provider = key.split(":")[0];
+  const stored = await photoStore?.read(key).catch((error) => {
+    console.warn("[PHOTO] Lecture du cache impossible.", { provider, error: (error as Error).message });
+    return undefined;
+  });
+  if (stored && Date.now() - stored.savedAt < PHOTO_MAX_AGE_MS) {
+    console.info("[PHOTO] Photo lue depuis le cache.", { provider });
+    studentPhotos.set(key, stored.dataUri);
+    return stored.dataUri;
+  }
+  const fresh = await download();
+  if (fresh?.startsWith("data:image/")) {
+    studentPhotos.set(key, fresh);
+    await photoStore?.write(key, fresh).catch((error) =>
+      console.warn("[PHOTO] Écriture du cache impossible.", { provider, error: (error as Error).message }));
+    return fresh;
+  }
+  if (stored) {
+    studentPhotos.set(key, stored.dataUri);
+    return stored.dataUri;
+  }
+  return fresh;
+}
+
 // Télécharge la photo et la renvoie en data URI pour que l'Image n'ait plus besoin de session/en-têtes.
 export async function inlinePhoto(
   url: string | undefined,
   label: string,
-  headers: Record<string, string> = {}
+  headers: Record<string, string> = {},
+  cacheKey?: string
 ): Promise<string | undefined> {
-  if (!url || url.startsWith("data:")) return url;
+  if (url?.startsWith("data:")) return url;
+  if (cacheKey) {
+    const photo = await cachedPhoto(cacheKey, async () => {
+      const downloaded = url ? await inlinePhoto(url, label, headers) : undefined;
+      return downloaded?.startsWith("data:") ? downloaded : undefined;
+    });
+    if (photo && url) cache.set(url, photo);
+    return photo ?? url;
+  }
+  if (!url) return url;
   const cached = cache.get(url);
   if (cached) return cached;
   let task = inflight.get(url);

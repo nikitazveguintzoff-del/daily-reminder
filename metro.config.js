@@ -11,6 +11,14 @@ const nodeAliases = new Map([
 ]);
 
 config.resolver.resolveRequest = (context, moduleName, platform) => {
+  const webAliases = {
+    "expo-secure-store": "src/web/secureStore.js",
+    "expo-web-browser": "src/web/authSession.ts",
+    "react-native-webview": "src/web/WebView.tsx"
+  };
+  if (platform === "web" && webAliases[moduleName]) {
+    return { type: "sourceFile", filePath: path.resolve(__dirname, webAliases[moduleName]) };
+  }
   const replacement = nodeAliases.get(moduleName);
   if (replacement) return { type: "sourceFile", filePath: replacement };
   return context.resolveRequest(context, moduleName, platform);

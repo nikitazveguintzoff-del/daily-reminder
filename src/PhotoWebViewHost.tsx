@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { StyleSheet, View } from "react-native";
+import { AppState, StyleSheet, View } from "react-native";
 import { WebView } from "react-native-webview";
 import { completeWebViewPhoto, subscribeWebViewPhotoRequests, type WebViewPhotoRequest } from "./photos";
 
@@ -27,7 +27,16 @@ true;
 
 export function PhotoWebViewHost() {
   const [requests, setRequests] = useState<WebViewPhotoRequest[]>([]);
-  useEffect(() => subscribeWebViewPhotoRequests(setRequests), []);
+  useEffect(() => {
+    let unsubscribe = () => {};
+    const update = (state: string) => {
+      unsubscribe();
+      unsubscribe = state === "active" ? subscribeWebViewPhotoRequests(setRequests) : () => {};
+    };
+    update(AppState.currentState);
+    const subscription = AppState.addEventListener("change", update);
+    return () => { unsubscribe(); subscription.remove(); };
+  }, []);
 
   return (
     <View pointerEvents="none" style={styles.host}>

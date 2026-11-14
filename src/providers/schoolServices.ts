@@ -1,8 +1,7 @@
 import { Buffer } from "buffer";
-import { inlinePhoto } from "../photos";
-import * as Crypto from "expo-crypto";
+import { cachedPhoto, inlinePhoto, photoCacheKey } from "../photos";
 import * as SecureStore from "expo-secure-store";
-import { ParentClient } from "pronotets";
+import { Homework, ParentClient, type Grade } from "pronotets";
 import {
   ChallengeMethod,
   GetOIDCWellKnown,
@@ -12,7 +11,8 @@ import {
   type AuthFlow,
   type Skolengo
 } from "skolengojs";
-import { pronoteLog, type PronoteSsoCapture } from "./pronoteSso";
+import { pronoteBaseUrl, pronoteLog, type PronoteSsoCapture } from "./pronoteSso";
+import type { CourseSlot } from "../courseDay";
 import type { CourseItem, GradeItem, HomeworkItem } from "../ecoleDirecte";
 import type { ProviderSchoolData, ProviderStudent } from "./types";
 
@@ -28,6 +28,7 @@ export type PronoteConnection = {
 };
 
 type PronoteSnapshot = { v: 4; url: string; username: string; token: string; uuid: string };
+const pronotePhotos = new WeakMap<object, string>();
 
 function normalizePhotoUrl(url?: string, baseUrl?: string): string | undefined {
   const value = url?.trim();
@@ -36,10 +37,9 @@ function normalizePhotoUrl(url?: string, baseUrl?: string): string | undefined {
   if (value.startsWith("//")) return `https:${value}`;
   if (baseUrl) {
     try {
-      const parsed = new URL(baseUrl);
-      return `${parsed.origin}${value.startsWith("/") ? "" : "/"}${value}`;
-    } catch {
-      // ignore
+      return new URL(value, baseUrl).toString();
+    } catch (error) {
+      console.warn("[PHOTO] Adresse de photo invalide.", { error: error instanceof Error ? error.name : "Error" });
     }
   }
   return value;
@@ -93,11 +93,12 @@ function pronoteStudents(session: ParentClient): ProviderStudent[] {
             : undefined;
     const photoValue = profilePictureUrl || (photoField ? rawChild[photoField.split(".")[0]] : undefined);
     const rawPhoto = typeof photoValue === "string" ? photoValue : undefined;
-    const baseUrl = (session as unknown as { readData?: { url?: string } }).readData?.url;
+    const baseUrl = session.pronoteUrl;
     const normalizedPhoto = normalizePhotoUrl(rawPhoto, baseUrl);
     console.info("[PRONOTE-PHOTO] Profil élève inspecté.", {
       index,
       fields: Object.keys(rawChild),
+      resourceFields: Object.keys((rawChild.rawResource as object | undefined) || {}),
       profilePicture: photoDiagnostic(profilePicture),
       photoField: photoField || null,
       photo: photoDiagnostic(photoValue),
@@ -110,32 +111,199 @@ function pronoteStudents(session: ParentClient): ProviderStudent[] {
       firstName: nameParts[0] || child.name,
       lastName: nameParts.slice(1).join(" "),
       className: child.className || "",
-      photo: normalizedPhoto
+      photo: isSessionBoundPhoto(normalizedPhoto) ? undefined : normalizedPhoto
     };
   });
 }
 
+// FichiersExternes URLs embed the Pronote session: useless (404) once displayed or stored elsewhere.
+export function isSessionBoundPhoto(url?: string): boolean {
+  return !!url && /\/FichiersExternes\//i.test(url);
+}
+
+type PronoteHttpResponse = { status: number; content: Buffer; headers?: { get(name: string): string | null } };
+type PronoteAttachment = {
+  url?: string;
+  id?: string;
+  name?: string;
+  data?: () => Promise<Uint8Array>;
+  _client?: {
+    attributes?: Record<string, unknown>;
+    communication?: {
+      rootSite?: string;
+      encryption?: { aesEncrypt: (data: Buffer) => Buffer };
+      session?: { get: (url: string) => Promise<PronoteHttpResponse> };
+    };
+  };
+};
+
+function imageMime(bytes: Buffer): string | undefined {
+  if (bytes[0] === 0x89 && bytes[1] === 0x50 && bytes[2] === 0x4e && bytes[3] === 0x47) return "image/png";
+  if (bytes[0] === 0xff && bytes[1] === 0xd8) return "image/jpeg";
+  if (bytes.subarray(0, 3).toString() === "GIF") return "image/gif";
+  if (bytes.subarray(0, 4).toString() === "RIFF" && bytes.subarray(8, 12).toString() === "WEBP") return "image/webp";
+  return undefined;
+}
+
+// pronotets pads the file entity itself and Node's cipher pads again: Pronote then cannot decode the
+// identifier and answers 404. Build the URL like the Pronote web client (single PKCS#7 padding) first,
+// and keep the library URL as a fallback.
+function pronotePhotoUrls(attachment: PronoteAttachment): { variant: string; url: string }[] {
+  const urls: { variant: string; url: string }[] = [];
+  const communication = attachment._client?.communication;
+  const sessionId = attachment._client?.attributes?.h;
+  if (attachment.id && communication?.rootSite && communication.encryption && sessionId !== undefined) {
+    const entity = Buffer.from(JSON.stringify({ N: attachment.id, Actif: true }), "utf8");
+    const magic = communication.encryption.aesEncrypt(entity).toString("hex");
+    const file = encodeURIComponent(attachment.name || "photo.jpg");
+    const typed = communication.encryption.aesEncrypt(Buffer.from(JSON.stringify({ N: attachment.id, G: 1 }), "utf8")).toString("hex");
+    urls.push(
+      { variant: "single-padding", url: `${communication.rootSite}/FichiersExternes/${magic}/${file}?Session=${sessionId}` },
+      // Entity used by recent clients (Blocksnote): {N, G} without Actif.
+      { variant: "entity-N-G", url: `${communication.rootSite}/FichiersExternes/${typed}/${file}?Session=${sessionId}` },
+      // POST payloads are sent in upper-case hex: some Pronote versions may only accept that form.
+      { variant: "single-padding-upper", url: `${communication.rootSite}/FichiersExternes/${magic.toUpperCase()}/${file}?Session=${sessionId}` }
+    );
+  }
+  if (attachment.url && !urls.some(({ url }) => url === attachment.url)) urls.push({ variant: "library", url: attachment.url });
+  return urls;
+}
+
+// Recent Pronote versions embed the picture in ParametresUtilisateur: the resource holds `photoBase64`,
+// an index into the envelope's clear `dataNonSec.fichiers` (the web client shows it as a data URI).
+// `ressources` sits next to `dataSec` in the response envelope; look a few levels deep to stay tolerant.
+function findPronoteFiles(value: unknown, depth = 0): unknown[] | undefined {
+  if (!value || typeof value !== "object" || depth > 4) return undefined;
+  const record = value as Record<string, unknown>;
+  const ressources = record.ressources as { fichiers?: unknown } | undefined;
+  if (Array.isArray(ressources?.fichiers)) return ressources.fichiers;
+  if (Array.isArray(record.fichiers)) return record.fichiers;
+  for (const [key, child] of Object.entries(record)) {
+    if (key === "_client" || key === "listeRessources") continue;
+    const found = findPronoteFiles(child, depth + 1);
+    if (found) return found;
+  }
+  return undefined;
+}
+
+function pronoteEmbeddedPhoto(child: object): string | undefined {
+  const { rawResource, _client } = child as {
+    rawResource?: { photoBase64?: unknown };
+    _client?: { parametresUtilisateur?: Record<string, unknown> };
+  };
+  let index = rawResource?.photoBase64;
+  if (index === undefined || index === null) return undefined;
+  if (typeof index === "object") index = (index as { V?: unknown }).V;
+  const settings = _client?.parametresUtilisateur;
+  let encoded: unknown;
+  if (typeof index === "string" && index.length > 64) {
+    encoded = index;
+  } else {
+    let nonSec = settings?.dataNonSec;
+    if (typeof nonSec === "string") {
+      try { nonSec = JSON.parse(nonSec); } catch { nonSec = undefined; }
+    }
+    const files = findPronoteFiles(nonSec) ?? findPronoteFiles(settings);
+    const entry = files?.[Number(index)];
+    encoded = typeof entry === "string" ? entry : (entry as { V?: unknown } | undefined)?.V;
+    if (typeof encoded !== "string" || !encoded) {
+      const dataSec = settings?.dataSec as Record<string, unknown> | undefined;
+      console.warn("[PRONOTE-PHOTO] photoBase64 présent mais fichier introuvable.", {
+        indexType: typeof index,
+        index: typeof index === "number" || (typeof index === "string" && index.length < 16) ? index : undefined,
+        files: files ? `array(${files.length})` : "absent",
+        entryType: typeof entry,
+        envelopeKeys: Object.keys(settings || {}),
+        dataNonSecType: typeof settings?.dataNonSec,
+        dataNonSecKeys: nonSec && typeof nonSec === "object" ? Object.keys(nonSec) : undefined,
+        dataSecKeys: Object.keys(dataSec || {}),
+        dataKeys: Object.keys((dataSec?.data as object | undefined) || {})
+      });
+      return undefined;
+    }
+  }
+  if (typeof encoded !== "string") return undefined;
+  const bytes = Buffer.from(encoded.replace(/^data:[^,]*,/, ""), "base64");
+  const mime = imageMime(bytes);
+  if (!mime) {
+    console.warn("[PRONOTE-PHOTO] photoBase64 n'est pas une image reconnue.", { length: bytes.length });
+    return undefined;
+  }
+  return `data:${mime};base64,${bytes.toString("base64")}`;
+}
+
+function pronoteStudentPhoto(child: unknown, studentId: string): Promise<string | undefined> {
+  return cachedPhoto(photoCacheKey("pronote", studentId), () => pronotePhotoData(child));
+}
+
 // L'URL de la photo n'est valable qu'avec la session Pronote : on la télécharge via le client.
 async function pronotePhotoData(child: unknown): Promise<string | undefined> {
+  if (!child || typeof child !== "object") return undefined;
+  const cached = pronotePhotos.get(child);
+  if (cached) return cached;
   try {
-    const attachment = (child as { profilePicture?: { data?: () => Promise<Uint8Array> } | null }).profilePicture;
-    if (!attachment || typeof attachment.data !== "function") return undefined;
-    const bytes = Buffer.from(await attachment.data());
-    if (bytes.length < 100) return undefined;
-    const mime = bytes[0] === 0x89 && bytes[1] === 0x50 ? "image/png" : "image/jpeg";
-    return `data:${mime};base64,${bytes.toString("base64")}`;
-  } catch {
+    const embedded = pronoteEmbeddedPhoto(child);
+    if (embedded) {
+      console.info("[PRONOTE-PHOTO] Photo récupérée.", { variant: "photoBase64" });
+      pronotePhotos.set(child, embedded);
+      return embedded;
+    }
+    const attachment = (child as { profilePicture?: PronoteAttachment | null }).profilePicture;
+    if (!attachment) {
+      console.info("[PRONOTE-PHOTO] Pronote ne déclare pas de photo pour cet élève (avecPhoto absent).");
+      return undefined;
+    }
+    const get = attachment._client?.communication?.session?.get.bind(attachment._client.communication.session);
+    const attempts: { variant: string; status?: number; length: number; type?: string; error?: string }[] = [];
+    let photo: string | undefined;
+    if (get) {
+      for (const { variant, url } of pronotePhotoUrls(attachment)) {
+        let response: PronoteHttpResponse;
+        try {
+          response = await get(url);
+        } catch (error) {
+          attempts.push({ variant, length: 0, error: error instanceof Error ? error.message : String(error) });
+          continue;
+        }
+        const bytes = Buffer.from(response.content);
+        const mime = response.status === 200 ? imageMime(bytes) : undefined;
+        attempts.push({ variant, status: response.status, length: bytes.length, type: response.headers?.get("content-type") || undefined });
+        if (mime) {
+          photo = `data:${mime};base64,${bytes.toString("base64")}`;
+          break;
+        }
+      }
+    } else if (typeof attachment.data === "function") {
+      const bytes = Buffer.from(await attachment.data());
+      const mime = imageMime(bytes);
+      attempts.push({ variant: "data", length: bytes.length });
+      if (mime) photo = `data:${mime};base64,${bytes.toString("base64")}`;
+    }
+    if (!photo) {
+      // Status and size only: the URL carries the session id.
+      console.warn("[PRONOTE-PHOTO] Aucune image valide reçue.", { attempts });
+      return undefined;
+    }
+    console.info("[PRONOTE-PHOTO] Photo récupérée.", { variant: attempts[attempts.length - 1]?.variant });
+    pronotePhotos.set(child, photo);
+    return photo;
+  } catch (error) {
+    console.warn("[PRONOTE-PHOTO] Échec du téléchargement authentifié.", {
+      error: error instanceof Error ? error.message : String(error)
+    });
     return undefined;
   }
 }
 
 async function pronoteConnection(session: ParentClient, credentials: PronoteSnapshot): Promise<PronoteConnection> {
-  const students = await Promise.all(
-    pronoteStudents(session).map(async (student, index) => ({
+  const students: ProviderStudent[] = [];
+  // Attachment requests share Pronote's session sequence; never run them in parallel.
+  for (const [index, student] of pronoteStudents(session).entries()) {
+    students.push({
       ...student,
-      photo: (await pronotePhotoData(session.children[index])) ?? (await inlinePhoto(student.photo, "PRONOTE"))
-    }))
-  );
+      photo: (await pronoteStudentPhoto(session.children[index], student.id)) ?? (student.photo ? await inlinePhoto(student.photo, "PRONOTE") : undefined)
+    });
+  }
   return {
     session,
     url: credentials.url,
@@ -236,7 +404,7 @@ async function recordPronoteFailure(error: unknown): Promise<void> {
   await SecureStore.setItemAsync(PRONOTE_COOLDOWN_KEY, JSON.stringify({ until, blocked } satisfies PronoteCooldown));
 }
 
-async function loginWithToken(snapshot: PronoteSnapshot, reason: "connect" | "restore"): Promise<PronoteConnection> {
+async function loginWithToken(snapshot: PronoteSnapshot, reason: "connect" | "restore", saveToken?: (token: string) => Promise<void>): Promise<PronoteConnection> {
   installPronoteTrafficLog();
   pronoteLog(`${reason}: token login starting`, { pronoteHost: hostOf(snapshot.url) });
   const startedAt = Date.now();
@@ -248,13 +416,16 @@ async function loginWithToken(snapshot: PronoteSnapshot, reason: "connect" | "re
     pronoteLog(`${reason}: login succeeded`, { ms: Date.now() - startedAt, children: session.children.length });
     // Tokens are single-use: the renewed one must replace the saved one.
     const renewed = session.exportCredentials();
-    return await pronoteConnection(session, {
+    const credentials: PronoteSnapshot = {
       v: 4,
       url: snapshot.url,
       username: renewed.username,
       token: renewed.password,
       uuid: renewed.uuid
-    });
+    };
+    // A photo failure or process termination must not lose the renewed single-use token.
+    await saveToken?.(JSON.stringify(credentials));
+    return await pronoteConnection(session, credentials);
   } catch (error) {
     await recordPronoteFailure(error);
     throw error;
@@ -262,26 +433,29 @@ async function loginWithToken(snapshot: PronoteSnapshot, reason: "connect" | "re
     pronoteTrafficDepth--;
   }
 }
-let pronoteLoginInFlight: Promise<PronoteConnection> | null = null;
+let pronoteLoginQueue: Promise<unknown> = Promise.resolve();
+const pendingPronoteLogins = new Map<string, Promise<PronoteConnection>>();
 
-function serializedLogin(run: () => Promise<PronoteConnection>): Promise<PronoteConnection> {
-  pronoteLoginInFlight ??= run().finally(() => {
-    pronoteLoginInFlight = null;
-  });
-  return pronoteLoginInFlight;
+function serializedLogin(key: string, run: () => Promise<PronoteConnection>): Promise<PronoteConnection> {
+  const pending = pendingPronoteLogins.get(key);
+  if (pending) return pending;
+  const result = pronoteLoginQueue.then(run).finally(() => pendingPronoteLogins.delete(key));
+  pendingPronoteLogins.set(key, result);
+  pronoteLoginQueue = result.catch(() => undefined);
+  return result;
 }
 
-export function connectPronoteSso(capture: PronoteSsoCapture): Promise<PronoteConnection> {
-  return serializedLogin(async () => {
+export function connectPronoteSso(capture: PronoteSsoCapture, saveToken?: (token: string) => Promise<void>): Promise<PronoteConnection> {
+  return serializedLogin(JSON.stringify(capture), async () => {
     pronoteLog("connect: requested", { pronoteHost: hostOf(capture.url) });
     await assertPronoteAllowed("connect");
     await SecureStore.setItemAsync(PRONOTE_LAST_ATTEMPT_KEY, String(Date.now()));
-    return loginWithToken({ v: 4, url: capture.url, username: capture.username, token: capture.token, uuid: capture.uuid }, "connect");
+    return loginWithToken({ v: 4, url: capture.url, username: capture.username, token: capture.token, uuid: capture.uuid }, "connect", saveToken);
   });
 }
 
-export function restorePronote(snapshot: string): Promise<PronoteConnection> {
-  return serializedLogin(async () => {
+export function restorePronote(snapshot: string, saveToken?: (token: string) => Promise<void>): Promise<PronoteConnection> {
+  return serializedLogin(snapshot, async () => {
     pronoteLog("restore: requested");
     await assertPronoteAllowed("restore");
     let saved: PronoteSnapshot | null = null;
@@ -301,7 +475,7 @@ export function restorePronote(snapshot: string): Promise<PronoteConnection> {
       throw new PronoteCooldownError(until);
     }
     await SecureStore.setItemAsync(PRONOTE_LAST_ATTEMPT_KEY, String(Date.now()));
-    return loginWithToken(saved, "restore");
+    return loginWithToken(saved, "restore", saveToken);
   });
 }
 
@@ -446,8 +620,8 @@ async function fetchSkolengoAgenda(
 ): Promise<SkolengoAgendaData> {
   await student.refreshAccessToken();
   const { accessToken, school } = student as unknown as { accessToken: string; school: School };
-  const dateKey = date.toISOString().slice(0, 10);
-  const endDateKey = (endDate || date).toISOString().slice(0, 10);
+  const dateKey = toLocalDateTime(date).slice(0, 10);
+  const endDateKey = toLocalDateTime(endDate || date).slice(0, 10);
   const query = new URLSearchParams({
     "page[limit]": "100",
     include: "lessons,lessons.subject,lessons.teachers,homeworkAssignments,homeworkAssignments.subject",
@@ -487,7 +661,8 @@ async function fetchSkolengoAgenda(
         start: toLocalDateTime(String(attributes.startDateTime || "")),
         end: toLocalDateTime(String(attributes.endDateTime || "")),
         room: String(attributes.location || ""),
-        teacher: teachers.join(", ")
+        teacher: teachers.join(", "),
+        ...(attributes.canceled ? { canceled: true } : {})
       }];
     });
     for (const id of relationshipIds(day, "homeworkAssignments")) {
@@ -517,9 +692,22 @@ export function fetchPronoteData(
   session: ParentClient,
   studentId: string,
   timetableDate: Date,
-  homeworkDays: number
+  homeworkDays: number,
+  saveToken?: (token: string) => Promise<void>
 ): Promise<ProviderSchoolData> {
-  const run = pronoteDataQueue.then(() => fetchPronoteDataNow(session, studentId, timetableDate, homeworkDays));
+  const run = pronoteDataQueue.then(async () => {
+    try { return await fetchPronoteDataNow(session, studentId, timetableDate, homeworkDays); }
+    finally {
+      if (saveToken) {
+        const credentials = session.exportCredentials();
+        const url = pronoteBaseUrl(session.pronoteUrl);
+        if (!url) throw new Error("Adresse de la session Pronote invalide.");
+        await saveToken(JSON.stringify({
+          v: 4, url, username: credentials.username, token: credentials.password, uuid: credentials.uuid
+        } satisfies PronoteSnapshot));
+      }
+    }
+  });
   pronoteDataQueue = run.catch(() => undefined);
   return run;
 }
@@ -562,13 +750,30 @@ async function fetchPronoteDataNow(
   };
 
   const allLessons = await logCall("lessons", () => session.lessons(timetableDate, timetableDate), true);
-  // pronotets throws a TypeError when Pronote omits the homework list (no homework in range).
-  const assignments = await logCall("homework", () => session.homework(timetableDate, homeworkEnd).catch((error) => {
-    if (error instanceof TypeError) return [];
-    throw error;
-  }), true);
-  const period = await logCall("currentPeriod", () => session.currentPeriod());
-  const grades = await logCall("grades", () => period.grades(), true);
+  const homeworkStart = new Date(timetableDate);
+  homeworkStart.setHours(0, 0, 0, 0);
+  const assignments = await logCall("homework", async () => {
+    // pronotets assumes ListeTravauxAFaire exists; only an omitted list means "no homework".
+    const response = await session.post("PageCahierDeTexte", 88, {
+      domaine: { _T: 8, V: `[${session.getWeek(homeworkStart)}..${session.getWeek(homeworkEnd)}]` }
+    }) as { dataSec?: { data?: { ListeTravauxAFaire?: { V?: unknown } } } };
+    if (!response.dataSec?.data) throw new Error("Réponse devoirs Pronote incomplète.");
+    const list = response.dataSec.data.ListeTravauxAFaire;
+    if (!list) return [];
+    if (!Array.isArray(list.V)) throw new Error("Liste des devoirs Pronote invalide.");
+    return list.V.map((item: unknown) => {
+      if (!item || typeof item !== "object" || Array.isArray(item)) throw new Error("Devoir Pronote invalide.");
+      return new Homework(session, item as Record<string, unknown>);
+    }).filter((item) => item.date >= homeworkStart && item.date <= homeworkEnd);
+  }, true);
+  let grades: Grade[] = [];
+  let gradesError: string | undefined;
+  try {
+    const period = await logCall("currentPeriod", () => session.currentPeriod());
+    grades = await logCall("grades", () => period.grades(), true);
+  } catch (error) {
+    gradesError = `Notes Pronote indisponibles : ${error instanceof Error ? error.message : String(error)}`;
+  }
 
   const courses: CourseItem[] = allLessons
     .map((lesson) => ({
@@ -620,35 +825,51 @@ async function fetchPronoteDataNow(
   const rawChild = student as unknown as Record<string, unknown>;
   const rawPhoto = (student.profilePicture as { url?: string } | undefined)?.url ||
     String(rawChild.avatar || rawChild.photo || rawChild.profilePicture || "");
-  const studentPhoto = (await pronotePhotoData(student)) ??
-    normalizePhotoUrl(rawPhoto, (session as unknown as { readData?: { url?: string } }).readData?.url);
+  const fallbackPhoto = normalizePhotoUrl(rawPhoto, session.pronoteUrl);
+  const studentPhoto = (await pronoteStudentPhoto(student, studentId)) ??
+    (isSessionBoundPhoto(fallbackPhoto) ? undefined : fallbackPhoto);
 
-  return { courses, homeworks, grades: mappedGrades, competencies: [], studentPhoto };
+  return { courses, homeworks, grades: mappedGrades, competencies: [], studentPhoto, gradesError };
 }
 
-export async function fetchSkolengoData(
+const skolengoDataQueues = new WeakMap<Skolengo, Promise<unknown>>();
+
+export function fetchSkolengoData(
   account: Skolengo,
   studentId: string,
   timetableDate: Date,
-  homeworkDays: number
+  homeworkDays: number,
+  saveToken?: (token: string) => Promise<void>
 ): Promise<ProviderSchoolData> {
-  const student = [...(account.kids ?? []), account].find((candidate) => candidate.userId === studentId);
-  if (!student) throw new Error("Élève Skolengo introuvable dans cette connexion.");
+  const run = (skolengoDataQueues.get(account) || Promise.resolve()).then(() =>
+    fetchSkolengoDataNow(account, studentId, timetableDate, homeworkDays, saveToken));
+  skolengoDataQueues.set(account, run.catch(() => undefined));
+  return run;
+}
+
+async function fetchSkolengoDataNow(
+  account: Skolengo,
+  studentId: string,
+  timetableDate: Date,
+  homeworkDays: number,
+  saveToken?: (token: string) => Promise<void>
+): Promise<ProviderSchoolData> {
+  const { student, request } = await skolengoStudent(account, studentId, saveToken);
   const homeworkEnd = new Date(timetableDate);
   homeworkEnd.setDate(homeworkEnd.getDate() + homeworkDays);
   homeworkEnd.setHours(23, 59, 59, 999);
-  const agenda = await fetchSkolengoAgenda(student, studentId, timetableDate, homeworkEnd);
+  const agenda = await request(() => fetchSkolengoAgenda(student, studentId, timetableDate, homeworkEnd));
   let assignments: Awaited<ReturnType<Skolengo["GetAssignments"]>>;
   try {
-    assignments = await student.GetAssignments(timetableDate, homeworkEnd);
+    assignments = await request(() => student.GetAssignments(timetableDate, homeworkEnd));
   } catch (error) {
     console.warn("[SKOLENGO] homework-assignments failed:", (error as Error).message);
-    assignments = [];
+    throw new Error(`Devoirs Skolengo incomplets : ${(error as Error).message}`);
   }
   let grades: Awaited<ReturnType<Skolengo["GetLastGrades"]>> = [];
   let gradesError: string | undefined;
   try {
-    grades = await student.GetLastGrades(30);
+    grades = await request(() => student.GetLastGrades(30));
   } catch (error) {
     gradesError = `Notes Skolengo indisponibles : ${(error as Error).message}`;
   }
@@ -677,4 +898,65 @@ export async function fetchSkolengoData(
     competencies: [],
     ...(gradesError ? { gradesError } : {})
   };
+}
+
+async function skolengoStudent(account: Skolengo, studentId: string, saveToken?: (token: string) => Promise<void>) {
+  const refreshed = await account.refreshAccessToken();
+  await saveToken?.(account.refreshToken);
+  // skolengojs copies credentials to each child and doesn't advance TTL after refresh.
+  // Share the latest credentials before calls, preventing reuse of a rotated refresh token.
+  type Tokens = { accessToken: string; accessTokenTTL: number };
+  const parentTokens = account as unknown as Tokens;
+  const tokenExpiry = (token: string): number => {
+    const payload = JSON.parse(Buffer.from(token.split(".")[1], "base64").toString("utf8")) as { exp?: unknown };
+    if (typeof payload.exp !== "number" || !Number.isFinite(payload.exp)) throw new Error("Expiration du jeton Skolengo invalide.");
+    return payload.exp * 1000;
+  };
+  if (refreshed) parentTokens.accessTokenTTL = tokenExpiry(parentTokens.accessToken);
+  const student = [...(account.kids ?? []), account].find((candidate) => candidate.userId === studentId);
+  if (!student) throw new Error("Élève Skolengo introuvable dans cette connexion.");
+  const studentTokens = student as unknown as Tokens;
+  studentTokens.accessToken = parentTokens.accessToken;
+  studentTokens.accessTokenTTL = parentTokens.accessTokenTTL;
+  student.refreshToken = account.refreshToken;
+  const request = async <T>(run: () => Promise<T>): Promise<T> => {
+    try { return await run(); }
+    finally {
+      if (account.refreshToken !== student.refreshToken) {
+        account.refreshToken = student.refreshToken;
+        await saveToken?.(account.refreshToken);
+      }
+      parentTokens.accessToken = studentTokens.accessToken;
+      parentTokens.accessTokenTTL = studentTokens.accessTokenTTL = tokenExpiry(studentTokens.accessToken);
+    }
+  };
+  return { student, request };
+}
+
+export function fetchSkolengoCourseSlots(
+  account: Skolengo,
+  studentId: string,
+  from: Date,
+  to: Date,
+  saveToken?: (token: string) => Promise<void>
+): Promise<CourseSlot[]> {
+  const run = (skolengoDataQueues.get(account) || Promise.resolve()).then(async () => {
+    const { student, request } = await skolengoStudent(account, studentId, saveToken);
+    const agenda = await request(() => fetchSkolengoAgenda(student, studentId, from, to));
+    return agenda.courses.map(({ start, end, canceled }) => ({ start, end, canceled }));
+  });
+  skolengoDataQueues.set(account, run.catch(() => undefined));
+  return run;
+}
+
+export function fetchPronoteCourseSlots(session: ParentClient, studentId: string, from: Date, to: Date): Promise<CourseSlot[]> {
+  const run = pronoteDataQueue.then(async () => {
+    const student = session.children.find((candidate) => candidate.id === studentId);
+    if (!student) throw new Error("Élève Pronote introuvable dans cette connexion.");
+    session.setChild(student);
+    const lessons = await session.lessons(from, to);
+    return lessons.map((lesson) => ({ start: toLocalDateTime(lesson.start), end: toLocalDateTime(lesson.end), canceled: !!lesson.canceled }));
+  });
+  pronoteDataQueue = run.catch(() => undefined);
+  return run;
 }

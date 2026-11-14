@@ -1,6 +1,7 @@
 import { Buffer } from "buffer";
-import { inlinePhoto } from "./photos";
+import { inlinePhoto, photoCacheKey } from "./photos";
 import { Client, Require2FA } from "@blockshub/blocksdirecte";
+import { firstCourseDay, lookaheadRange, noonOf, type CourseSlot } from "./courseDay";
 
 const runtimeGlobal = globalThis as typeof globalThis & { Buffer?: typeof Buffer };
 runtimeGlobal.Buffer ??= Buffer;
@@ -11,6 +12,7 @@ export type CourseItem = {
   end: string;
   room: string;
   teacher: string;
+  canceled?: boolean;
 };
 
 export type HomeworkItem = {
@@ -498,7 +500,7 @@ export async function fetchSchoolData(
       photo: await inlinePhoto(formatEcoleDirectePhoto(student.photo), "ECOLEDIRECTE", {
         "User-Agent": USER_AGENT,
         Referer: "https://www.ecoledirecte.com/"
-      })
+      }, photoCacheKey("ecoleDirecte", student.id))
     },
     courses: mappedCourses,
     homeworks,
@@ -537,39 +539,34 @@ export async function fetchStudentsSchoolData(
   }));
 }
 
-function courseEndTimestamp(value: string): number {
-  const match = value.match(/^(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2})/);
-  if (!match) return 0;
-  return new Date(
-    Number(match[1]),
-    Number(match[2]) - 1,
-    Number(match[3]),
-    Number(match[4]),
-    Number(match[5])
-  ).getTime();
+export async function fetchCourseSlots(session: EdSession, student: EdPupil, from: Date, to: Date): Promise<CourseSlot[]> {
+  if (!session.token) throw new Error("Aucun compte École Directe connecté.");
+  const courses = await request<Array<{ start_date?: string; end_date?: string; isAnnule?: boolean }>>(
+    session,
+    `/v3/E/${student.id}/emploidutemps.awp`,
+    "get",
+    { dateDebut: dayKey(from), dateFin: dayKey(to), avecTrous: false }
+  );
+  return courses.map((course) => ({ start: course.start_date || "", end: course.end_date || "", canceled: !!course.isAnnule }));
 }
 
+// Without `fixedDay`, shows the first day (today included) that still has a course to come.
 export async function fetchStudentsSchoolDataWithAutoAdvance(
   session: EdSession,
   homeworkDays: number,
-  timetableDate: Date
+  fixedDay?: Date
 ): Promise<{ data: SchoolData[]; selectedDay: Date }> {
-  const selectedDay = new Date(timetableDate);
-  selectedDay.setHours(12, 0, 0, 0);
-  let data = await fetchStudentsSchoolData(session, homeworkDays, selectedDay);
-  const now = new Date();
-  const isCurrentDay = selectedDay.getFullYear() === now.getFullYear() &&
-    selectedDay.getMonth() === now.getMonth() &&
-    selectedDay.getDate() === now.getDate();
-  if (!isCurrentDay || data.length === 0 || data.some((student) => student.error)) {
-    return { data, selectedDay };
+  let selectedDay = fixedDay ? noonOf(fixedDay) : undefined;
+  if (!selectedDay) {
+    const now = new Date();
+    const { from, to } = lookaheadRange(now);
+    const pupils = session.pupils ?? (session.student?.typeCompte === "E" ? [session.student] : []);
+    const slots = (await Promise.all(pupils.map((pupil) => fetchCourseSlots(session, pupil, from, to).catch((error) => {
+      console.warn("[ED] Course lookahead failed:", (error as Error).message);
+      return [];
+    })))).flat();
+    selectedDay = firstCourseDay(slots, now) ?? noonOf(now);
   }
-
-  const courseEnds = data.flatMap((student) => student.courses.map((course) => courseEndTimestamp(course.end)));
-  const lastCourseEnd = Math.max(0, ...courseEnds);
-  if (lastCourseEnd === 0 || lastCourseEnd > Date.now()) return { data, selectedDay };
-
-  selectedDay.setDate(selectedDay.getDate() + 1);
-  data = await fetchStudentsSchoolData(session, homeworkDays, selectedDay);
+  const data = await fetchStudentsSchoolData(session, homeworkDays, selectedDay);
   return { data, selectedDay };
 }

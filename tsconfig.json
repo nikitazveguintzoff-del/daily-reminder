@@ -1,6 +1,8 @@
 {
   "extends": "expo/tsconfig.base",
   "compilerOptions": {
-    "strict": true
-  }
+    "strict": true,
+    "types": ["node", "react"]
+  },
+  "exclude": ["node_modules", ".expo", "dist", "web-build", "android", "ios"]
 }
